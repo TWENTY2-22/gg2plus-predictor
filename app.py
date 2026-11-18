@@ -294,6 +294,32 @@ st.header("📷 Check your own list")
 st.markdown("Upload one or more screenshots of matches, or paste the list. "
             "The app finds the matches in all of them and ranks them together.")
 
+NOISE = {"fc", "wfc", "women", "womens", "ladies", "lionesses", "w", "afc",
+         "cf", "sc", "club", "ac", "fk", "sk", "bk", "if", "the"}
+WOMEN_RE = re.compile(r"\b(women|womens|wfc|ladies|lionesses|feminin\w*|frauen)\b", re.I)
+
+
+def is_women(name):
+    n = str(name).strip()
+    return bool(WOMEN_RE.search(n)) or bool(re.search(r"\bW$", n))
+
+
+def loose_find(name):
+    toks = [t for t in clean(name).split() if t not in NOISE]
+    c2 = " ".join(toks)
+    if len(c2) < 3:
+        return None
+    t = find_team(c2, None, 0.8)
+    if t:
+        return t
+    padded = f" {c2} "
+    best = None
+    for key, val in team_index.items():
+        if len(key) >= 4 and f" {key} " in padded:
+            if best is None or len(key) > len(best[0]):
+                best = (key, val)
+    return best[1] if best else None
+
 
 @st.cache_data
 def ocr_image(data: bytes):
@@ -302,47 +328,54 @@ def ocr_image(data: bytes):
     return pytesseract.image_to_string(im, config="--psm 6")
 
 
-SEP = re.compile(r"\s+(?:vs\.?|v|-|–|—)\s+|\||\t|\s{2,}", re.I)
+VS = re.compile(r"\s+(?:vs\.?|v)\s+|\s+[-–—]\s+", re.I)
 
 
 def parse_matches(txt):
     out = []
     for line in txt.splitlines():
-        cells = [x.strip() for x in SEP.split(line) if x.strip()]
-        found = []
-        for cell in cells:
-            cell = re.sub(r"\b\d+(?:[.:,]\d+)?\b", " ", cell)
-            t = find_team(cell, None, 0.8)
-            if t and t not in found:
-                found.append(t)
-        if len(found) >= 2:
-            out.append((found[0][1], found[1][1]))
+        line = line.strip()
+        if not line:
+            continue
+        parts = VS.split(line, maxsplit=1)
+        if len(parts) != 2:
+            continue
+        h, a = parts
+        h = re.sub(r"^[^A-Za-z]*(?:yes|no)\b[\s:.\-]*", "", h, flags=re.I)
+        h = re.sub(r"[^\w&' .\-]+", " ", h).strip()
+        a = re.sub(r"\b(?:going|gg|goals?)\b.*$", "", a, flags=re.I)
+        a = re.sub(r"\d+[.,]\d+\s*$", "", a)
+        a = re.sub(r"[^\w&' .\-]+", " ", a).strip()
+        if len(h) >= 3 and len(a) >= 3:
+            out.append((h, a))
     return out
 
 
 ups = st.file_uploader("Upload pictures of the matches (you can pick several)",
                        type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-pasted = st.text_area("Or paste the list here (one match per line)", height=120)
+pasted = st.text_area("Or paste the list here (one match per line, like: Arsenal v Chelsea)",
+                      height=120)
 
 texts = [pasted] if pasted.strip() else []
 if ups:
     if pytesseract is None:
-        st.warning("Picture reading is not installed yet. Add packages.txt "
-                   "and requirements.txt, or paste the list instead.")
+        st.warning("Picture reading is not installed yet. Paste the list instead.")
     else:
         read_ok, read_fail = 0, []
         for f in ups:
             try:
                 texts.append(ocr_image(f.getvalue()))
                 read_ok += 1
-            except Exception:
-                read_fail.append(f.name)
+            except Exception as e:
+                read_fail.append(f"{f.name} ({type(e).__name__}: {e})")
         st.caption(f"{read_ok} of {len(ups)} pictures read.")
         if read_fail:
-            st.warning("Could not read: " + ", ".join(read_fail) +
-                       ". Try clearer screenshots or paste those lists.")
+            st.warning("Could not read: " + ", ".join(read_fail))
 
 if texts:
+    with st.expander("What the app read from the pictures"):
+        st.text("\n\n-----\n\n".join(texts))
+
     parsed, seen = [], set()
     for t in texts:
         for pair in parse_matches(t):
@@ -353,17 +386,27 @@ if texts:
     base = pd.DataFrame(parsed, columns=["Home", "Away"])
     edited = st.data_editor(base, num_rows="dynamic", use_container_width=True,
                             key=f"ed_{len(parsed)}_{len(ups) if ups else 0}")
-    res, unknown = [], []
+
+    res, unrated = [], []
     for _, r in edited.dropna().iterrows():
-        h = find_team(str(r["Home"]), None, 0.7)
-        a = find_team(str(r["Away"]), None, 0.7)
+        hn, an = str(r["Home"]), str(r["Away"])
+        if is_women(hn) or is_women(an):
+            unrated.append(f"{hn} v {an}: women's match, no data")
+            continue
+        h, a = loose_find(hn), loose_find(an)
+        note = ""
+        if h and not a:
+            a, note = (h[0], None), "away team estimated"
+        elif a and not h:
+            h, note = (a[0], None), "home team estimated"
         if not h or not a or h == a:
-            unknown.append(f"{r['Home']} v {r['Away']}")
+            unrated.append(f"{hn} v {an}: teams not in the data files")
             continue
         prob, lh, la = pair_prob(h, a)
-        res.append({"Home": h[1], "Away": a[1],
+        res.append({"Home": hn, "Away": an,
                     "GG2+ chance %": round(prob * 100, 1),
-                    "Exp. goals": f"{lh:.1f} - {la:.1f}"})
+                    "Exp. goals": f"{lh:.1f} - {la:.1f}",
+                    "Note": note})
     if res:
         df_r = pd.DataFrame(res).sort_values("GG2+ chance %", ascending=False)
         best = df_r[df_r["GG2+ chance %"] >= min_prob].head(8)
@@ -373,10 +416,11 @@ if texts:
         else:
             st.subheader(f"Best {len(best)} from your list")
             st.dataframe(best, hide_index=True, use_container_width=True)
-        with st.expander("All analysed matches"):
+        with st.expander("All rated matches"):
             st.dataframe(df_r, hide_index=True, use_container_width=True)
-    if unknown:
-        st.caption("Not recognised (check the spelling): " + "; ".join(unknown))
+    if unrated:
+        with st.expander(f"Not rated ({len(unrated)})"):
+            st.write("\n".join(f"- {u}" for u in unrated))
 
 st.markdown("---")
 st.markdown("""
