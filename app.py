@@ -1,19 +1,22 @@
 import glob
+import difflib
+import unicodedata
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from scipy.stats import poisson
 
-st.set_page_config(page_title="GG2+ Predictor", page_icon="⚽", layout="centered")
-
-st.title("⚽ GG2+ Predictor")
-st.markdown("**Both teams score at least 2 goals each**")
+st.set_page_config(page_title="GG2+ Daily Picks", page_icon="⚽", layout="centered")
+st.title("⚽ GG2+ Daily Picks")
+st.markdown("**Top matches where both teams may score at least 2 goals each**")
 st.markdown("---")
 
 LEAGUE_NAMES = {
     "E0": "England - Premier League", "E1": "England - Championship",
     "E2": "England - League One", "E3": "England - League Two",
-    "SC0": "Scotland - Premiership", "D1": "Germany - Bundesliga",
+    "EC": "England - Conference", "SC0": "Scotland - Premiership",
+    "SC1": "Scotland - Championship", "D1": "Germany - Bundesliga",
     "D2": "Germany - 2. Bundesliga", "I1": "Italy - Serie A",
     "I2": "Italy - Serie B", "SP1": "Spain - La Liga",
     "SP2": "Spain - Segunda", "F1": "France - Ligue 1",
@@ -23,12 +26,18 @@ LEAGUE_NAMES = {
     "BRA": "Brazil - Serie A", "USA": "USA - MLS",
 }
 
+# ESPN schedule codes for leagues missing from the football-data fixtures file
+ESPN_LEAGUES = {"bra.1": "BRA", "usa.1": "USA"}
+
+def clean(s):
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
+    return s.lower().strip()
+
 @st.cache_data
-def load_data():
+def load_results():
     frames = []
     for f in glob.glob("*.xlsx"):
-        sheets = pd.read_excel(f, sheet_name=None)
-        for sheet, d in sheets.items():
+        for sheet, d in pd.read_excel(f, sheet_name=None).items():
             d = d.rename(columns={"Home": "HomeTeam", "Away": "AwayTeam",
                                   "HG": "FTHG", "AG": "FTAG"})
             need = ["HomeTeam", "AwayTeam", "FTHG", "FTAG"]
@@ -40,75 +49,146 @@ def load_data():
             d = d.dropna()
             if d.empty:
                 continue
-            d["League"] = LEAGUE_NAMES.get(sheet, sheet)
+            d["Div"] = sheet
             frames.append(d)
-    if not frames:
-        return None
-    return pd.concat(frames, ignore_index=True)
+    return pd.concat(frames, ignore_index=True) if frames else None
 
 @st.cache_data
-def build_strengths(df, league):
-    d = df[df["League"] == league]
-    avg_h = d["FTHG"].mean()
-    avg_a = d["FTAG"].mean()
-    avg_all = (avg_h + avg_a) / 2
-    k = 4  # smoothing so teams with few games are not extreme
-    att, dfn = {}, {}
-    for t in set(d["HomeTeam"]) | set(d["AwayTeam"]):
-        h = d[d["HomeTeam"] == t]
-        a = d[d["AwayTeam"] == t]
-        games = len(h) + len(a)
-        scored = h["FTHG"].sum() + a["FTAG"].sum()
-        conceded = h["FTAG"].sum() + a["FTHG"].sum()
-        att[t] = (scored + k * avg_all) / (games + k) / avg_all
-        dfn[t] = (conceded + k * avg_all) / (games + k) / avg_all
-    return att, dfn, avg_h, avg_a
+def build_strengths(df):
+    out = {}
+    k = 4
+    for div, d in df.groupby("Div"):
+        avg_h, avg_a = d["FTHG"].mean(), d["FTAG"].mean()
+        avg_all = (avg_h + avg_a) / 2
+        if avg_all == 0:
+            continue
+        att, dfn = {}, {}
+        for t in set(d["HomeTeam"]) | set(d["AwayTeam"]):
+            h = d[d["HomeTeam"] == t]
+            a = d[d["AwayTeam"] == t]
+            games = len(h) + len(a)
+            scored = h["FTHG"].sum() + a["FTAG"].sum()
+            conceded = h["FTAG"].sum() + a["FTHG"].sum()
+            att[t] = (scored + k * avg_all) / (games + k) / avg_all
+            dfn[t] = (conceded + k * avg_all) / (games + k) / avg_all
+        out[div] = (att, dfn, avg_h, avg_a)
+    return out
 
-df = load_data()
-if df is None:
-    st.error("No data files found. Upload the .xlsx files to the repo.")
-    st.stop()
+def match_team(name, teams):
+    """Match an ESPN team name to the closest name in our results data."""
+    if name in teams:
+        return name
+    lookup = {clean(t): t for t in teams}
+    c = clean(name)
+    if c in lookup:
+        return lookup[c]
+    best = difflib.get_close_matches(c, list(lookup), n=1, cutoff=0.6)
+    return lookup[best[0]] if best else None
 
-league = st.selectbox("League", sorted(df["League"].unique()))
-attack, defence, avg_h, avg_a = build_strengths(df, league)
-teams = sorted(attack.keys())
+@st.cache_data(ttl=3600)
+def load_euro_fixtures():
+    fx = pd.read_csv("https://football-data.co.uk/fixtures.csv", encoding="latin-1")
+    fx = fx.dropna(subset=["HomeTeam", "AwayTeam"])
+    fx["Date"] = pd.to_datetime(fx["Date"], dayfirst=True, errors="coerce")
+    return fx.dropna(subset=["Date"])[["Div", "Date", "HomeTeam", "AwayTeam"]]
 
-col1, col2 = st.columns(2)
-with col1:
-    home_team = st.selectbox("Home Team", teams, index=0)
-with col2:
-    away_team = st.selectbox("Away Team", teams, index=min(1, len(teams) - 1))
+@st.cache_data(ttl=3600)
+def load_espn_fixtures(dates):
+    rows = []
+    for code, div in ESPN_LEAGUES.items():
+        for d in dates:
+            url = ("https://site.api.espn.com/apis/site/v2/sports/soccer/"
+                   f"{code}/scoreboard?dates={d}")
+            try:
+                data = requests.get(url, timeout=10).json()
+            except Exception:
+                continue
+            for e in data.get("events", []):
+                try:
+                    if e["status"]["type"]["state"] != "pre":
+                        continue
+                    comp = e["competitions"][0]["competitors"]
+                    home = next(c for c in comp if c["homeAway"] == "home")
+                    away = next(c for c in comp if c["homeAway"] == "away")
+                    rows.append({
+                        "Div": div,
+                        "Date": pd.Timestamp(d),
+                        "HomeTeam": home["team"]["displayName"],
+                        "AwayTeam": away["team"]["displayName"],
+                    })
+                except Exception:
+                    continue
+    return pd.DataFrame(rows, columns=["Div", "Date", "HomeTeam", "AwayTeam"])
 
-def predict(home, away):
-    lam_h = float(np.clip(attack[home] * defence[away] * avg_h, 0.35, 3.2))
-    lam_a = float(np.clip(attack[away] * defence[home] * avg_a, 0.25, 2.8))
+def gg2_prob(home, away, s):
+    att, dfn, avg_h, avg_a = s
+    lam_h = float(np.clip(att[home] * dfn[away] * avg_h, 0.35, 3.2))
+    lam_a = float(np.clip(att[away] * dfn[home] * avg_a, 0.25, 2.8))
     p_h = 1 - poisson.pmf(0, lam_h) - poisson.pmf(1, lam_h)
     p_a = 1 - poisson.pmf(0, lam_a) - poisson.pmf(1, lam_a)
     return p_h * p_a, lam_h, lam_a
 
-if st.button("Predict GG2+", type="primary", use_container_width=True):
-    if home_team == away_team:
-        st.warning("Please pick two different teams.")
-    else:
-        prob, lh, la = predict(home_team, away_team)
-        st.markdown("### Result")
-        st.metric("Probability both teams score ≥ 2 goals", f"{prob*100:.1f}%")
-        c1, c2 = st.columns(2)
-        c1.metric("Expected Home Goals", f"{lh:.2f}")
-        c2.metric("Expected Away Goals", f"{la:.2f}")
-        if prob >= 0.18:
-            st.success("🔥 Relatively high chance for this rare market")
-        elif prob >= 0.13:
-            st.info("Average / slightly above average chance")
-        else:
-            st.warning("Below average chance")
+results = load_results()
+if results is None:
+    st.error("No data files found. Upload the .xlsx files to the repo.")
+    st.stop()
+strengths = build_strengths(results)
+
+choice = st.radio("Show picks for", ["Today", "Tomorrow", "Next 3 days"], horizontal=True)
+today = pd.Timestamp.today().normalize()
+if choice == "Today":
+    start, end = today, today
+elif choice == "Tomorrow":
+    start = end = today + pd.Timedelta(days=1)
+else:
+    start, end = today, today + pd.Timedelta(days=3)
+
+dates = tuple(d.strftime("%Y%m%d") for d in pd.date_range(start, end))
+
+parts = []
+try:
+    euro = load_euro_fixtures()
+    parts.append(euro[(euro["Date"] >= start) & (euro["Date"] <= end)])
+except Exception:
+    st.caption("Could not load the European fixtures right now.")
+parts.append(load_espn_fixtures(dates))
+fixtures = pd.concat(parts, ignore_index=True)
+
+rows = []
+for _, r in fixtures.iterrows():
+    div = r["Div"]
+    if div not in strengths:
+        continue
+    att = strengths[div][0]
+    h = match_team(r["HomeTeam"], att.keys())
+    a = match_team(r["AwayTeam"], att.keys())
+    if h is None or a is None:
+        continue
+    prob, lh, la = gg2_prob(h, a, strengths[div])
+    rows.append({
+        "Date": r["Date"].strftime("%d %b"),
+        "League": LEAGUE_NAMES.get(div, div),
+        "Home": r["HomeTeam"],
+        "Away": r["AwayTeam"],
+        "GG2+ chance %": round(prob * 100, 1),
+        "Exp. goals": f"{lh:.1f} - {la:.1f}",
+    })
+
+if not rows:
+    st.warning("No matches found for this period. Try 'Next 3 days'.")
+else:
+    top = pd.DataFrame(rows).sort_values("GG2+ chance %", ascending=False).head(10)
+    st.subheader(f"Top {len(top)} picks")
+    st.dataframe(top, hide_index=True, use_container_width=True)
+    st.caption(f"{len(rows)} matches checked.")
 
 st.markdown("---")
 st.markdown("""
 **What is GG2+?**  
-Both teams score **at least 2 goals each** (examples: 2-2, 3-2, 2-3, 4-2, etc.)
+Both teams score **at least 2 goals each** (examples: 2-2, 3-2, 2-3, 4-2).
 
-**How the model works**  
-It uses match results from the data files to estimate each team's attack and
-defence strength inside its league, then calculates the probability with a Poisson model.
+**How the picks are made**  
+The app learns each team's attack and defence strength from past results,
+estimates the goals for each upcoming match with a Poisson model, and ranks
+matches by the chance of GG2+.
 """)
