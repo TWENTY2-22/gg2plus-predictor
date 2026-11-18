@@ -1,6 +1,7 @@
 import glob
 import io
 import re
+import time
 import difflib
 import unicodedata
 from functools import lru_cache
@@ -52,6 +53,9 @@ ESPN_CUPS = {
     "uefa.champions": "Champions League", "uefa.europa": "Europa League",
     "uefa.europa.conf": "Conference League",
 }
+
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+BUCKET = int(time.time() // 21600)  # refresh live data every 6 hours
 
 
 def clean(s):
@@ -135,6 +139,12 @@ def find_team(name, div=None, cutoff=0.75):
     return pool[best[0]] if best else None
 
 
+def two_plus(lam_h, lam_a):
+    p_h = 1 - poisson.pmf(0, lam_h) - poisson.pmf(1, lam_h)
+    p_a = 1 - poisson.pmf(0, lam_a) - poisson.pmf(1, lam_a)
+    return p_h * p_a
+
+
 def pair_prob(h, a):
     hd, ht = h
     ad, at = a
@@ -149,9 +159,7 @@ def pair_prob(h, a):
         avg_a = (strengths[hd][3] + strengths[ad][3]) / 2
     lam_h = float(np.clip(att_h * def_a * avg_h, 0.35, 3.2))
     lam_a = float(np.clip(att_a * def_h * avg_a, 0.25, 2.8))
-    p_h = 1 - poisson.pmf(0, lam_h) - poisson.pmf(1, lam_h)
-    p_a = 1 - poisson.pmf(0, lam_a) - poisson.pmf(1, lam_a)
-    return p_h * p_a, lam_h, lam_a
+    return two_plus(lam_h, lam_a), lam_h, lam_a
 
 
 @st.cache_data(ttl=3600)
@@ -285,14 +293,136 @@ with st.expander("🔍 Diagnostics: which leagues were found"):
     if skipped:
         st.write("Skipped matches:")
         st.write("\n".join(f"- {s}" for s in skipped[:40]))
-    st.caption("Leagues not on this list have no matches in the period "
-               "(international break or off-season), or the source has no feed for them.")
+
+# ---------------- Live team lookup (for your own list) ----------------
+BASE_RATE = 1.35  # average goals per team per game, used to steady small samples
+
+
+def _walk(o):
+    if isinstance(o, dict):
+        yield o
+        for v in o.values():
+            yield from _walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _walk(v)
+
+
+def _score(x):
+    if isinstance(x, dict):
+        x = x.get("value", x.get("displayValue"))
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def search_query(name):
+    q = clean(name)
+    q = re.sub(r"\b(wfc|women|womens|ladies|lionesses|w)\b", " ", q)
+    q = re.sub(r"\b(fc|afc|sc|cf)\b", " ", q)
+    return re.sub(r"\s+", " ", q).strip()
+
+
+def _is_women_name(n):
+    n = str(n).lower()
+    return "women" in n or bool(re.search(r"\bw$", n.strip()))
+
+
+@lru_cache(maxsize=None)
+def espn_team_id(name, women, bucket):
+    q = search_query(name)
+    if not q:
+        return None
+    tries = [q + (" women" if women else "")]
+    if len(q.split()) > 2:
+        tries.append(" ".join(q.split()[:2]) + (" women" if women else ""))
+    best = (0.0, None)
+    for query in tries:
+        url = ("https://site.web.api.espn.com/apis/common/v3/search"
+               f"?region=us&lang=en&limit=15&query={requests.utils.quote(query)}")
+        try:
+            data = requests.get(url, timeout=8, headers=HEADERS).json()
+        except Exception:
+            continue
+        seen = set()
+        for d in _walk(data):
+            m = re.search(r"s:600~t:(\d+)", str(d.get("uid", "")))
+            nm = d.get("displayName") or d.get("name")
+            if not m or not nm or m.group(1) in seen:
+                continue
+            seen.add(m.group(1))
+            cw = _is_women_name(nm)
+            if women != cw:
+                continue
+            score = difflib.SequenceMatcher(None, search_query(nm), q).ratio()
+            if score > best[0]:
+                best = (score, m.group(1))
+        if best[0] >= 0.6:
+            break
+    return best[1] if best[0] >= 0.6 else None
+
+
+@lru_cache(maxsize=None)
+def espn_recent(team_id, bucket):
+    url = ("https://site.api.espn.com/apis/site/v2/sports/soccer/all/"
+           f"teams/{team_id}/schedule")
+    try:
+        data = requests.get(url, timeout=8, headers=HEADERS).json()
+    except Exception:
+        return []
+    games = []
+    for e in data.get("events", []):
+        try:
+            comp = e["competitions"][0]
+            stt = comp.get("status") or e.get("status") or {}
+            t = stt.get("type", {})
+            if not (t.get("completed") or t.get("state") == "post"):
+                continue
+            mine = opp = None
+            for c in comp["competitors"]:
+                s = _score(c.get("score"))
+                if str(c["team"]["id"]) == str(team_id):
+                    mine = s
+                else:
+                    opp = s
+            if mine is None or opp is None:
+                continue
+            games.append((e.get("date", ""), mine, opp))
+        except Exception:
+            continue
+    games.sort()
+    return games[-12:]
+
+
+@lru_cache(maxsize=None)
+def live_stats(key, bucket):
+    name, women = key
+    tid = espn_team_id(name, women, bucket)
+    if not tid:
+        return None
+    g = espn_recent(tid, bucket)
+    if len(g) < 4:
+        return None
+    n = len(g)
+    k = 3
+    scored_ = sum(x[1] for x in g)
+    conceded_ = sum(x[2] for x in g)
+    return ((scored_ + k * BASE_RATE) / (n + k),
+            (conceded_ + k * BASE_RATE) / (n + k), n)
+
+
+def live_prob(sh, sa):
+    lam_h = float(np.clip((sh[0] + sa[1]) / 2 * 1.08, 0.35, 3.2))
+    lam_a = float(np.clip((sa[0] + sh[1]) / 2 * 0.95, 0.25, 2.8))
+    return two_plus(lam_h, lam_a), lam_h, lam_a
+
 
 # ---------------- Pictures / pasted list ----------------
 st.markdown("---")
 st.header("📷 Check your own list")
-st.markdown("Upload one or more screenshots of matches, or paste the list. "
-            "The app finds the matches in all of them and ranks them together.")
+st.markdown("Upload screenshots or paste a list. The app looks up each team's "
+            "recent results and shows your best 7 matches.")
 
 NOISE = {"fc", "wfc", "women", "womens", "ladies", "lionesses", "w", "afc",
          "cf", "sc", "club", "ac", "fk", "sk", "bk", "if", "the"}
@@ -376,50 +506,65 @@ if texts:
     with st.expander("What the app read from the pictures"):
         st.text("\n\n-----\n\n".join(texts))
 
-    parsed, seen = [], set()
+    parsed, seen_pairs = [], set()
     for t in texts:
         for pair in parse_matches(t):
-            if pair not in seen:
-                seen.add(pair)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
                 parsed.append(pair)
-    st.caption(f"{len(parsed)} matches found. Fix any mistakes or add rows below.")
-    base = pd.DataFrame(parsed, columns=["Home", "Away"])
-    edited = st.data_editor(base, num_rows="dynamic", use_container_width=True,
-                            key=f"ed_{len(parsed)}_{len(ups) if ups else 0}")
 
-    res, unrated = [], []
-    for _, r in edited.dropna().iterrows():
-        hn, an = str(r["Home"]), str(r["Away"])
-        if is_women(hn) or is_women(an):
-            unrated.append(f"{hn} v {an}: women's match, no data")
-            continue
-        h, a = loose_find(hn), loose_find(an)
-        note = ""
-        if h and not a:
-            a, note = (h[0], None), "away team estimated"
-        elif a and not h:
-            h, note = (a[0], None), "home team estimated"
-        if not h or not a or h == a:
-            unrated.append(f"{hn} v {an}: teams not in the data files")
-            continue
-        prob, lh, la = pair_prob(h, a)
-        res.append({"Home": hn, "Away": an,
-                    "GG2+ chance %": round(prob * 100, 1),
-                    "Exp. goals": f"{lh:.1f} - {la:.1f}",
-                    "Note": note})
-    if res:
-        df_r = pd.DataFrame(res).sort_values("GG2+ chance %", ascending=False)
-        best = df_r[df_r["GG2+ chance %"] >= min_prob].head(8)
-        if best.empty:
-            st.info(f"None of these matches reach {min_prob}%. "
-                    "No strong GG2+ pick in this list.")
+    with st.expander(f"{len(parsed)} matches found (tap to fix mistakes)"):
+        base = pd.DataFrame(parsed, columns=["Home", "Away"])
+        edited = st.data_editor(base, num_rows="dynamic", use_container_width=True,
+                                key=f"ed_{len(parsed)}_{len(ups) if ups else 0}")
+
+    pairs = [(str(r["Home"]), str(r["Away"])) for _, r in edited.dropna().iterrows()]
+    keys = sorted({(n, is_women(h) or is_women(a)) for h, a in pairs for n in (h, a)})
+
+    with st.spinner("Looking up recent results for each team..."):
+        with ThreadPoolExecutor(8) as ex:
+            stats = dict(zip(keys, ex.map(lambda k: live_stats(k, BUCKET), keys)))
+
+    rows, unrated = [], []
+    for hn, an in pairs:
+        women = is_women(hn) or is_women(an)
+        sh, sa = stats.get((hn, women)), stats.get((an, women))
+        if sh and sa:
+            prob, lh, la = live_prob(sh, sa)
+            data_src = f"Live results ({sh[2]}+{sa[2]} games)"
         else:
-            st.subheader(f"Best {len(best)} from your list")
-            st.dataframe(best, hide_index=True, use_container_width=True)
+            h = None if women else loose_find(hn)
+            a = None if women else loose_find(an)
+            if h and a and h != a:
+                prob, lh, la = pair_prob(h, a)
+                data_src = "League files"
+            else:
+                unrated.append(f"{hn} v {an}")
+                continue
+        rows.append({"Home": hn, "Away": an,
+                     "GG2+ chance %": round(prob * 100, 1),
+                     "Exp. goals": f"{lh:.1f} - {la:.1f}",
+                     "Verdict": "Strong" if prob * 100 >= min_prob else "Weak",
+                     "Data": data_src})
+
+    if rows:
+        df_all = pd.DataFrame(rows).sort_values("GG2+ chance %", ascending=False)
+        top7 = df_all.head(7)
+        st.subheader("Best 7 from your list")
+        st.dataframe(top7, hide_index=True, use_container_width=True)
+        n_strong = int((top7["Verdict"] == "Strong").sum())
+        if n_strong == 0:
+            st.info(f"None of these reach {min_prob}%. These are the best of a weak "
+                    "list, so skipping is reasonable.")
+        st.caption(f"{len(rows)} of {len(pairs)} matches rated.")
         with st.expander("All rated matches"):
-            st.dataframe(df_r, hide_index=True, use_container_width=True)
+            st.dataframe(df_all, hide_index=True, use_container_width=True)
+    else:
+        st.warning("None of the matches could be rated.")
     if unrated:
-        with st.expander(f"Not rated ({len(unrated)})"):
+        with st.expander(f"{len(unrated)} matches could not be rated"):
+            st.write("No recent results were found for one of the teams in these "
+                     "matches. Check the spelling in the table above.")
             st.write("\n".join(f"- {u}" for u in unrated))
 
 st.markdown("---")
@@ -428,7 +573,6 @@ st.markdown("""
 Both teams score **at least 2 goals each** (examples: 2-2, 3-2, 2-3, 4-2).
 
 **How the picks are made**  
-The app learns each team's attack and defence strength from past results,
-estimates the goals for each match with a Poisson model, and shows only
-matches above your minimum chance.
+The app reads each team's recent results, estimates the goals for the match
+with a Poisson model, and ranks matches by the chance of GG2+.
 """)
