@@ -35,11 +35,9 @@ LEAGUE_NAMES = {
     "F2": "France - Ligue 2", "N1": "Netherlands - Eredivisie",
     "B1": "Belgium - Pro League", "P1": "Portugal - Primeira Liga",
     "T1": "Turkey - Super Lig", "G1": "Greece - Super League",
-    "BRA": "Brazil - Serie A", "Brazil": "Brazil - Serie A",
-    "USA": "USA - MLS",
+    "Brazil": "Brazil - Serie A", "USA": "USA - MLS",
 }
 
-# ESPN schedule codes. A wrong code just returns nothing.
 ESPN_LEAGUES = {
     "bra.1": "Brazil", "usa.1": "USA", "swe.1": "Sweden", "nor.1": "Norway",
     "den.1": "Denmark", "sui.1": "Switzerland", "aut.1": "Austria",
@@ -140,8 +138,10 @@ def find_team(name, div=None, cutoff=0.75):
 def pair_prob(h, a):
     hd, ht = h
     ad, at = a
-    att_h, def_h = strengths[hd][0][ht], strengths[hd][1][ht]
-    att_a, def_a = strengths[ad][0][at], strengths[ad][1][at]
+    att_h = strengths[hd][0].get(ht, 1.0)
+    def_h = strengths[hd][1].get(ht, 1.0)
+    att_a = strengths[ad][0].get(at, 1.0)
+    def_a = strengths[ad][1].get(at, 1.0)
     if hd == ad:
         avg_h, avg_a = strengths[hd][2], strengths[hd][3]
     else:
@@ -201,7 +201,8 @@ def load_espn(start, end):
 
 # ---------------- Daily picks ----------------
 st.header("📅 Daily picks")
-choice = st.radio("Show picks for", ["Today", "Tomorrow", "Next 3 days"], horizontal=True)
+choice = st.radio("Show picks for", ["Today", "Tomorrow", "Next 3 days", "Next 7 days"],
+                  horizontal=True)
 min_prob = st.slider("Minimum GG2+ chance (%)", 8, 30, 14)
 
 today = pd.Timestamp.today().normalize()
@@ -209,8 +210,10 @@ if choice == "Today":
     start, end = today, today
 elif choice == "Tomorrow":
     start = end = today + pd.Timedelta(days=1)
-else:
+elif choice == "Next 3 days":
     start, end = today, today + pd.Timedelta(days=3)
+else:
+    start, end = today, today + pd.Timedelta(days=7)
 
 fx_rows = []
 try:
@@ -224,28 +227,41 @@ except Exception:
     st.caption("Could not load the European fixtures right now.")
 fx_rows += load_espn(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
 
-scored, skipped = [], 0
+scored, skipped, counts = [], [], {}
 for r in fx_rows:
+    comp = LEAGUE_NAMES.get(r["Comp"], r["Comp"])
+    counts.setdefault(comp, [0, 0])
+    counts[comp][0] += 1
+    note = ""
     if r["Cup"]:
         h = find_team(r["HomeTeam"], None, 0.85)
         a = find_team(r["AwayTeam"], None, 0.85)
-    else:
+    elif r["Div"] in strengths:
         h = find_team(r["HomeTeam"], r["Div"], 0.7)
         a = find_team(r["AwayTeam"], r["Div"], 0.7)
+        if h or a:
+            if not h:
+                h, note = (r["Div"], None), "home team estimated"
+            if not a:
+                a, note = (r["Div"], None), "away team estimated"
+    else:
+        h = a = None
     if not h or not a or h == a:
-        skipped += 1
+        skipped.append(f"{comp}: {r['HomeTeam']} v {r['AwayTeam']}")
         continue
     prob, lh, la = pair_prob(h, a)
+    counts[comp][1] += 1
     scored.append({
         "Date": r["Date"].strftime("%d %b"),
-        "Competition": LEAGUE_NAMES.get(r["Comp"], r["Comp"]),
+        "Competition": comp,
         "Home": r["HomeTeam"], "Away": r["AwayTeam"],
         "GG2+ chance %": round(prob * 100, 1),
         "Exp. goals": f"{lh:.1f} - {la:.1f}",
+        "Note": note,
     })
 
 if not scored:
-    st.warning("No matches found for this period.")
+    st.warning("No matches could be rated for this period. Try 'Next 7 days'.")
 else:
     df_s = pd.DataFrame(scored).sort_values("GG2+ chance %", ascending=False)
     strong = df_s[df_s["GG2+ chance %"] >= min_prob].head(10)
@@ -256,14 +272,27 @@ else:
     else:
         st.subheader(f"Top {len(strong)} picks")
         st.dataframe(strong, hide_index=True, use_container_width=True)
-    st.caption(f"{len(scored)} matches checked. {skipped} skipped "
-               "(team not in the data files).")
+    st.caption(f"{len(scored)} matches rated, {len(skipped)} skipped.")
 
-# ---------------- Picture / pasted list ----------------
+with st.expander("🔍 Diagnostics: which leagues were found"):
+    if counts:
+        diag = pd.DataFrame(
+            [{"Competition": k, "Matches found": v[0], "Matches rated": v[1]}
+             for k, v in sorted(counts.items())])
+        st.dataframe(diag, hide_index=True, use_container_width=True)
+    else:
+        st.write("No fixtures were returned by any source for these dates.")
+    if skipped:
+        st.write("Skipped matches:")
+        st.write("\n".join(f"- {s}" for s in skipped[:40]))
+    st.caption("Leagues not on this list have no matches in the period "
+               "(international break or off-season), or the source has no feed for them.")
+
+# ---------------- Pictures / pasted list ----------------
 st.markdown("---")
 st.header("📷 Check your own list")
-st.markdown("Upload a screenshot of matches, or paste the list. "
-            "The app finds the matches and ranks them.")
+st.markdown("Upload one or more screenshots of matches, or paste the list. "
+            "The app finds the matches in all of them and ranks them together.")
 
 
 @st.cache_data
@@ -291,27 +320,39 @@ def parse_matches(txt):
     return out
 
 
-up = st.file_uploader("Upload a picture of the matches", type=["png", "jpg", "jpeg"])
+ups = st.file_uploader("Upload pictures of the matches (you can pick several)",
+                       type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 pasted = st.text_area("Or paste the list here (one match per line)", height=120)
 
-text = pasted
-if up is not None:
+texts = [pasted] if pasted.strip() else []
+if ups:
     if pytesseract is None:
         st.warning("Picture reading is not installed yet. Add packages.txt "
                    "and requirements.txt, or paste the list instead.")
     else:
-        try:
-            text += "\n" + ocr_image(up.getvalue())
-        except Exception:
-            st.warning("Could not read the picture. Try a clearer screenshot "
-                       "or paste the list.")
+        read_ok, read_fail = 0, []
+        for f in ups:
+            try:
+                texts.append(ocr_image(f.getvalue()))
+                read_ok += 1
+            except Exception:
+                read_fail.append(f.name)
+        st.caption(f"{read_ok} of {len(ups)} pictures read.")
+        if read_fail:
+            st.warning("Could not read: " + ", ".join(read_fail) +
+                       ". Try clearer screenshots or paste those lists.")
 
-if text.strip():
-    parsed = parse_matches(text)
-    st.caption("Matches found. Fix any mistakes or add rows below.")
+if texts:
+    parsed, seen = [], set()
+    for t in texts:
+        for pair in parse_matches(t):
+            if pair not in seen:
+                seen.add(pair)
+                parsed.append(pair)
+    st.caption(f"{len(parsed)} matches found. Fix any mistakes or add rows below.")
     base = pd.DataFrame(parsed, columns=["Home", "Away"])
     edited = st.data_editor(base, num_rows="dynamic", use_container_width=True,
-                            key=f"ed_{len(text)}")
+                            key=f"ed_{len(parsed)}_{len(ups) if ups else 0}")
     res, unknown = [], []
     for _, r in edited.dropna().iterrows():
         h = find_team(str(r["Home"]), None, 0.7)
