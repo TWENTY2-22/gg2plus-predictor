@@ -72,6 +72,18 @@ ESPN_COMPS = {
     "uefa.europa": ("Europa League", None, True),
     "uefa.europa.conf": ("Conference League", None, True),
 }
+# Extra team lists used only to find teams from your slips. A wrong code returns nothing.
+EXTRA_DIR_CODES = [
+    "eng.w.1", "esp.w.1", "ger.w.1", "fra.w.1", "ita.w.1", "usa.w.1",
+    "uefa.w.champions", "ned.2", "ger.3", "por.2", "tur.2", "bel.2", "sco.3",
+    "qat.1", "ksa.1", "uae.1", "idn.1", "phi.1", "ind.1", "aus.1", "kor.1",
+    "egy.1", "rsa.1", "col.1", "chi.1", "uru.1", "per.1", "ecu.1", "par.1",
+    "bol.1", "ven.1", "cro.1", "cze.1", "hun.1", "ukr.1", "isr.1", "ser.1",
+    "bul.1", "svk.1", "slo.1", "nir.1", "wal.1", "isl.1", "cyp.1", "kaz.1",
+    "tha.1", "mys.1", "sgp.1", "vnm.1", "hkg.1", "nzl.1", "crc.1", "gua.1",
+    "hon.1", "pan.1", "jam.1", "mar.1", "tun.1", "alg.1", "nga.1", "gha.1",
+    "ger.4", "esp.3", "ita.3", "fra.3", "eng.6",
+]
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 BUCKET = int(time.time() // 21600)
 BASE_RATE = 1.35
@@ -249,8 +261,53 @@ def _women_name(n):
     return "women" in n or bool(re.search(r"\bw$", n.strip()))
 
 
+def best_match(q, cands):
+    best = (0.0, None)
+    for tid, nm in cands:
+        n = search_query(nm)
+        if not n or not q:
+            continue
+        s = difflib.SequenceMatcher(None, n, q).ratio()
+        if min(len(q), len(n)) >= 4 and (q in n or n in q):
+            s = max(s, 0.85)
+        if s > best[0]:
+            best = (s, tid)
+    return best
+
+
+@lru_cache(maxsize=None)
+def directory(bucket):
+    """All teams from ESPN league team lists: list of (id, name, is_women)."""
+    codes = list(ESPN_COMPS.keys()) + EXTRA_DIR_CODES
+
+    def fetch(code):
+        url = ("https://site.api.espn.com/apis/site/v2/sports/soccer/"
+               f"{code}/teams?limit=1000")
+        try:
+            data = requests.get(url, timeout=8, headers=HEADERS).json()
+        except Exception:
+            return []
+        w = ".w." in code
+        out = []
+        for d in _walk(data):
+            if d.get("id") and d.get("displayName") and d.get("slug"):
+                out.append((str(d["id"]), str(d["displayName"]), w))
+        return out
+
+    with ThreadPoolExecutor(8) as ex:
+        parts = list(ex.map(fetch, codes))
+    seen, res = set(), []
+    for part in parts:
+        for t in part:
+            if (t[0], t[2]) not in seen:
+                seen.add((t[0], t[2]))
+                res.append(t)
+    return res
+
+
 @lru_cache(maxsize=None)
 def espn_team_id(name, women, bucket):
+    """Backup: ESPN site search."""
     q = search_query(name)
     if not q:
         return None
@@ -265,18 +322,16 @@ def espn_team_id(name, women, bucket):
             data = requests.get(url, timeout=8, headers=HEADERS).json()
         except Exception:
             continue
-        seen = set()
+        cands, seen = [], set()
         for d in _walk(data):
             m = re.search(r"s:600~t:(\d+)", str(d.get("uid", "")))
             nm = d.get("displayName") or d.get("name")
-            if not m or not nm or m.group(1) in seen:
-                continue
-            seen.add(m.group(1))
-            if women != _women_name(nm):
-                continue
-            score = difflib.SequenceMatcher(None, search_query(nm), q).ratio()
-            if score > best[0]:
-                best = (score, m.group(1))
+            if m and nm and m.group(1) not in seen and women == _women_name(nm):
+                seen.add(m.group(1))
+                cands.append((m.group(1), str(nm)))
+        s, tid = best_match(q, cands)
+        if s > best[0]:
+            best = (s, tid)
         if best[0] >= 0.6:
             break
     return best[1] if best[0] >= 0.6 else None
@@ -290,14 +345,13 @@ def espn_recent(team_id, bucket):
         data = requests.get(url, timeout=8, headers=HEADERS).json()
     except Exception:
         return []
+    now = pd.Timestamp.utcnow().tz_localize(None)
     games = []
     for e in data.get("events", []):
         try:
             comp = e["competitions"][0]
             stt = comp.get("status") or e.get("status") or {}
             t = stt.get("type", {})
-            if not (t.get("completed") or t.get("state") == "post"):
-                continue
             mine = opp = None
             for c in comp["competitors"]:
                 s = _score(c.get("score"))
@@ -306,6 +360,10 @@ def espn_recent(team_id, bucket):
                 else:
                     opp = s
             if mine is None or opp is None:
+                continue
+            when = pd.to_datetime(e.get("date", ""), utc=True).tz_convert(None)
+            done = bool(t.get("completed")) or t.get("state") == "post" or when < now
+            if not done:
                 continue
             games.append((e.get("date", ""), mine, opp))
         except Exception:
@@ -328,9 +386,35 @@ def id_stats(tid, bucket):
 
 
 @lru_cache(maxsize=None)
-def live_stats(key, bucket):
+def lookup(key, bucket):
+    """Returns (stats or None, info dict explaining what happened)."""
     name, women = key
-    return id_stats(espn_team_id(name, women, bucket), bucket)
+    info = {"id": None, "why": ""}
+    q = search_query(name)
+    if not q:
+        info["why"] = "name too short to search"
+        return None, info
+    cands = [(i, n) for i, n, w in directory(bucket) if w == women]
+    s, tid = best_match(q, cands)
+    src = "team list"
+    if s < 0.6:
+        tid = None
+    if not tid:
+        tid = espn_team_id(name, women, bucket)
+        src = "search"
+    if not tid:
+        info["why"] = "team not found on ESPN"
+        return None, info
+    info["id"] = tid
+    g = espn_recent(tid, bucket)
+    if len(g) < 4:
+        info["why"] = f"found via {src}, but only {len(g)} recent games read"
+        return None, info
+    n, k = len(g), 3
+    sc = sum(x[1] for x in g)
+    co = sum(x[2] for x in g)
+    info["why"] = "ok"
+    return ((sc + k * BASE_RATE) / (n + k), (co + k * BASE_RATE) / (n + k), n), info
 
 
 def live_lams(sh, sa):
@@ -419,7 +503,7 @@ def check_results(hist):
         if md > today:
             continue
         women = is_women(e["home"]) or is_women(e["away"])
-        tid = e.get("hid") or espn_team_id(e["home"], women, BUCKET)
+        tid = e.get("hid") or lookup((e["home"], women), BUCKET)[1]["id"]
         if not tid:
             continue
         for date, mine, opp in espn_recent(tid, fresh):
@@ -526,15 +610,16 @@ with tab_slip:
 
         pairs = [(str(r["Home"]), str(r["Away"])) for _, r in edited.dropna().iterrows()]
         keys = sorted({(n, is_women(h) or is_women(a)) for h, a in pairs for n in (h, a)})
-        with st.spinner("Looking up each team..."):
+        with st.spinner("Looking up each team (the first time takes a while)..."):
+            directory(BUCKET)
             with ThreadPoolExecutor(8) as ex:
-                stats = dict(zip(keys, ex.map(lambda k: live_stats(k, BUCKET), keys)))
+                looked = dict(zip(keys, ex.map(lambda k: lookup(k, BUCKET), keys)))
 
         rows, unrated = [], []
         for hn, an in pairs:
             women = is_women(hn) or is_women(an)
-            sh, sa = stats.get((hn, women)), stats.get((an, women))
-            hid = espn_team_id(hn, women, BUCKET) if sh else None
+            sh, ih = looked[(hn, women)]
+            sa, ia = looked[(an, women)]
             if sh and sa:
                 lh, la = live_lams(sh, sa)
                 src = "Live results"
@@ -545,13 +630,14 @@ with tab_slip:
                     lh, la = file_lams(h, a)
                     src = "League files"
                 else:
-                    unrated.append(f"{hn} v {an}")
+                    unrated.append({"Match": f"{hn} v {an}",
+                                    "Home team": ih["why"], "Away team": ia["why"]})
                     continue
             rows.append({"Home": hn, "Away": an, "Match": f"{hn} v {an}",
-                         "lh": lh, "la": la, "Data": src, "hid": hid or ""})
+                         "lh": lh, "la": la, "Data": src, "hid": ih["id"] or ""})
 
         if not rows:
-            st.warning("None of the matches could be rated. Check the spelling above.")
+            st.warning("None of the matches could be rated. See the reasons below.")
         else:
             df_slip = add_chances(pd.DataFrame(rows))
             rank = st.radio("Rank my best 7 by", ["GG2+", "GG"], horizontal=True)
@@ -584,9 +670,9 @@ with tab_slip:
                         "hid": r["hid"], "score": None})
             add_history(entries)
         if unrated:
-            with st.expander(f"{len(unrated)} not rated"):
-                st.write("No recent results were found for one of the teams.")
-                st.write("\n".join(f"- {u}" for u in unrated))
+            with st.expander(f"{len(unrated)} not rated: why", expanded=True):
+                st.dataframe(pd.DataFrame(unrated), hide_index=True,
+                             use_container_width=True)
 
 # ======== Daily picks ========
 with tab_daily:
@@ -675,7 +761,6 @@ with tab_daily:
                    "worked out now, so they are a rough check and not the original "
                    "pre-match numbers. Saved picks in History keep the original.")
 
-        # Save upcoming strong picks to History
         entries = []
         today_iso = today.strftime("%Y-%m-%d")
         up = df_d[(df_d["state"] == "pre")]
