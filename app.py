@@ -85,9 +85,11 @@ EXTRA_DIR_CODES = [
     "ger.4", "esp.3", "ita.3", "fra.3", "eng.6",
 ]
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-BUCKET = int(time.time() // 21600)
+BUCKET = int(time.time() // 21600)   # team data: refreshed every 6 hours
+RB = int(time.time() // 600)         # results: refreshed every 10 minutes
 BASE_RATE = 1.35
 HIST_PATH = os.path.join(tempfile.gettempdir(), "gg_history_v2.json")
+ONE_DAY = pd.Timedelta(days=1)
 
 
 # ---------------- Helpers ----------------
@@ -261,15 +263,20 @@ def _women_name(n):
     return "women" in n or bool(re.search(r"\bw$", n.strip()))
 
 
+def name_score(a, b):
+    n, q = search_query(a), search_query(b)
+    if not n or not q:
+        return 0.0
+    s = difflib.SequenceMatcher(None, n, q).ratio()
+    if min(len(q), len(n)) >= 4 and (q in n or n in q):
+        s = max(s, 0.85)
+    return s
+
+
 def best_match(q, cands):
     best = (0.0, None)
     for tid, nm in cands:
-        n = search_query(nm)
-        if not n or not q:
-            continue
-        s = difflib.SequenceMatcher(None, n, q).ratio()
-        if min(len(q), len(n)) >= 4 and (q in n or n in q):
-            s = max(s, 0.85)
+        s = name_score(nm, q)
         if s > best[0]:
             best = (s, tid)
     return best
@@ -339,6 +346,7 @@ def espn_team_id(name, women, bucket):
 
 @lru_cache(maxsize=None)
 def espn_recent(team_id, bucket):
+    """Completed games of a team: (date, goals_for, goals_against, opp_id, opp_name)."""
     url = ("https://site.api.espn.com/apis/site/v2/sports/soccer/all/"
            f"teams/{team_id}/schedule")
     try:
@@ -353,30 +361,49 @@ def espn_recent(team_id, bucket):
             stt = comp.get("status") or e.get("status") or {}
             t = stt.get("type", {})
             mine = opp = None
+            oid, oname = "", ""
             for c in comp["competitors"]:
                 s = _score(c.get("score"))
                 if str(c["team"]["id"]) == str(team_id):
                     mine = s
                 else:
                     opp = s
+                    oid = str(c["team"].get("id", ""))
+                    oname = str(c["team"].get("displayName", ""))
             if mine is None or opp is None:
                 continue
             when = pd.to_datetime(e.get("date", ""), utc=True).tz_convert(None)
             done = bool(t.get("completed")) or t.get("state") == "post" or when < now
             if not done:
                 continue
-            games.append((e.get("date", ""), mine, opp))
+            games.append((e.get("date", ""), mine, opp, oid, oname))
         except Exception:
             continue
     games.sort()
-    return games[-12:]
+    return games[-30:]
+
+
+def find_result(tid, opp_name, since, until, bucket):
+    """Final score 'home-away' of the game vs opp_name between two dates, or None."""
+    if not tid:
+        return None
+    for date, mine, opp, oid, oname in espn_recent(tid, bucket):
+        try:
+            gd = pd.to_datetime(date, utc=True).tz_convert(None).normalize()
+        except Exception:
+            continue
+        if gd < since or gd > until:
+            continue
+        if name_score(oname, opp_name) >= 0.6:
+            return f"{int(mine)}-{int(opp)}"
+    return None
 
 
 @lru_cache(maxsize=None)
 def id_stats(tid, bucket):
     if not tid:
         return None
-    g = espn_recent(tid, bucket)
+    g = espn_recent(tid, bucket)[-12:]
     if len(g) < 4:
         return None
     n, k = len(g), 3
@@ -406,7 +433,7 @@ def lookup(key, bucket):
         info["why"] = "team not found on ESPN"
         return None, info
     info["id"] = tid
-    g = espn_recent(tid, bucket)
+    g = espn_recent(tid, bucket)[-12:]
     if len(g) < 4:
         info["why"] = f"found via {src}, but only {len(g)} recent games read"
         return None, info
@@ -486,16 +513,23 @@ def save_history(h):
 
 def add_history(entries):
     hist = load_history()
-    keys = {e["key"] for e in hist}
-    new = [e for e in entries if e["key"] not in keys]
-    if new:
-        save_history(hist + new)
+    index = {e["key"]: e for e in hist}
+    changed = False
+    for e in entries:
+        old = index.get(e["key"])
+        if old is None:
+            hist.append(e)
+            changed = True
+        elif e.get("score") and not old.get("score"):
+            old["score"] = e["score"]
+            changed = True
+    if changed:
+        save_history(hist)
 
 
 def check_results(hist):
     changed = 0
     today = pd.Timestamp.today().normalize()
-    fresh = int(time.time())
     for e in hist:
         if e.get("score"):
             continue
@@ -504,17 +538,10 @@ def check_results(hist):
             continue
         women = is_women(e["home"]) or is_women(e["away"])
         tid = e.get("hid") or lookup((e["home"], women), BUCKET)[1]["id"]
-        if not tid:
-            continue
-        for date, mine, opp in espn_recent(tid, fresh):
-            try:
-                gd = pd.to_datetime(date, utc=True).tz_convert(None).normalize()
-            except Exception:
-                continue
-            if md <= gd <= md + pd.Timedelta(days=4):
-                e["score"] = f"{int(mine)}-{int(opp)}"
-                changed += 1
-                break
+        sc = find_result(tid, e["away"], md - ONE_DAY, md + 10 * ONE_DAY, RB)
+        if sc:
+            e["score"] = sc
+            changed += 1
     return changed
 
 
@@ -568,6 +595,8 @@ def add_chances(df):
     df["Exp. goals"] = [f"{a:.1f} - {b:.1f}" for a, b in zip(df["lh"], df["la"])]
     return df
 
+
+TODAY = pd.Timestamp.today().normalize()
 
 # ---------------- Page ----------------
 st.title("⚽ GG Predictor")
@@ -633,26 +662,35 @@ with tab_slip:
                     unrated.append({"Match": f"{hn} v {an}",
                                     "Home team": ih["why"], "Away team": ia["why"]})
                     continue
+            score = find_result(ih["id"], an, TODAY - 7 * ONE_DAY, TODAY + ONE_DAY, RB)
             rows.append({"Home": hn, "Away": an, "Match": f"{hn} v {an}",
-                         "lh": lh, "la": la, "Data": src, "hid": ih["id"] or ""})
+                         "lh": lh, "la": la, "Data": src, "hid": ih["id"] or "",
+                         "Score": score or ""})
 
         if not rows:
             st.warning("None of the matches could be rated. See the reasons below.")
         else:
             df_slip = add_chances(pd.DataFrame(rows))
+            df_slip["GG2+ result"] = [result_icon(s, 2) for s in df_slip["Score"]]
+            df_slip["GG result"] = [result_icon(s, 1) for s in df_slip["Score"]]
+
             rank = st.radio("Rank my best 7 by", ["GG2+", "GG"], horizontal=True)
             col = "GG2+ %" if rank == "GG2+" else "GG %"
             mn = min2 if rank == "GG2+" else min1
             top = df_slip.sort_values(col, ascending=False).head(7).copy()
             top["Verdict"] = np.where(top[col] >= mn, "Strong", "Weak")
-            st.dataframe(top[["Match", "GG2+ %", "GG %", "Exp. goals", "Verdict", "Data"]],
+            st.dataframe(top[["Match", "GG2+ %", "GG %", "Score", "GG2+ result",
+                              "GG result", "Verdict"]],
                          hide_index=True, use_container_width=True,
                          column_config={"GG2+ %": CFG2, "GG %": CFG1})
             if (top["Verdict"] == "Strong").sum() == 0:
                 st.info(f"None reach {mn}% for {rank}. Skipping is reasonable.")
-            st.caption(f"{len(rows)} of {len(pairs)} matches rated. Saved to History.")
+            played = int((df_slip["Score"] != "").sum())
+            st.caption(f"{len(rows)} of {len(pairs)} matches rated. "
+                       f"{played} already played, with scores shown. "
+                       "Upload the same slip again after the matches to see results.")
 
-            today_iso = pd.Timestamp.today().normalize().strftime("%Y-%m-%d")
+            today_iso = TODAY.strftime("%Y-%m-%d")
             picked = {}
             for _, r in df_slip.sort_values("GG2+ %", ascending=False).head(7).iterrows():
                 picked.setdefault(r["Match"], set()).add("GG2+")
@@ -667,7 +705,7 @@ with tab_slip:
                         "away": r["Away"], "gg2": float(r["GG2+ %"]),
                         "gg1": float(r["GG %"]),
                         "picked": ", ".join(sorted(picked[r["Match"]])),
-                        "hid": r["hid"], "score": None})
+                        "hid": r["hid"], "score": r["Score"] or None})
             add_history(entries)
         if unrated:
             with st.expander(f"{len(unrated)} not rated: why", expanded=True):
@@ -678,12 +716,12 @@ with tab_slip:
 with tab_daily:
     period = st.selectbox("Period", ["Today", "Tomorrow", "Next 3 days", "Next 7 days",
                                      "Yesterday", "Last 3 days"])
-    today = pd.Timestamp.today().normalize()
-    one = pd.Timedelta(days=1)
     start, end = {
-        "Today": (today, today), "Tomorrow": (today + one, today + one),
-        "Next 3 days": (today, today + 3 * one), "Next 7 days": (today, today + 7 * one),
-        "Yesterday": (today - one, today - one), "Last 3 days": (today - 3 * one, today - one),
+        "Today": (TODAY, TODAY), "Tomorrow": (TODAY + ONE_DAY, TODAY + ONE_DAY),
+        "Next 3 days": (TODAY, TODAY + 3 * ONE_DAY),
+        "Next 7 days": (TODAY, TODAY + 7 * ONE_DAY),
+        "Yesterday": (TODAY - ONE_DAY, TODAY - ONE_DAY),
+        "Last 3 days": (TODAY - 3 * ONE_DAY, TODAY - ONE_DAY),
     }[period]
 
     with st.spinner("Loading matches..."):
@@ -762,7 +800,7 @@ with tab_daily:
                    "pre-match numbers. Saved picks in History keep the original.")
 
         entries = []
-        today_iso = today.strftime("%Y-%m-%d")
+        today_iso = TODAY.strftime("%Y-%m-%d")
         up = df_d[(df_d["state"] == "pre")]
         for _, r in up.iterrows():
             tags = []
@@ -792,12 +830,17 @@ with tab_daily:
 # ======== History ========
 with tab_hist:
     hist = load_history()
+    pending_h = [e for e in hist if not e.get("score")
+                 and pd.Timestamp(e["match_date"]) <= TODAY]
     b1, b2 = st.columns(2)
-    if b1.button("🔄 Check results", use_container_width=True):
-        with st.spinner("Looking up final scores..."):
+    manual = b1.button("🔄 Re-check results", use_container_width=True)
+    if pending_h and (manual or time.time() - st.session_state.get("last_auto", 0) > 600):
+        with st.spinner("Checking results..."):
             n = check_results(hist)
             save_history(hist)
-        st.success(f"{n} results found.")
+        st.session_state["last_auto"] = time.time()
+        if manual:
+            st.success(f"{n} new results found.")
         hist = load_history()
 
     if hist:
@@ -850,7 +893,8 @@ with tab_hist:
             except Exception:
                 st.error("That file could not be read.")
     st.caption("History is kept on the app server. It is cleared when the app "
-               "restarts or when you change the code, so download it regularly.")
+               "restarts or when you change the code, so download it regularly. "
+               "You can always upload an old slip in 'My slip' to see its results.")
 
 with st.expander("How it works"):
     st.markdown("""
