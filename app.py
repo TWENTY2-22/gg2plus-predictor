@@ -1,7 +1,10 @@
 import glob
 import io
+import os
 import re
+import json
 import time
+import tempfile
 import difflib
 import unicodedata
 from functools import lru_cache
@@ -19,10 +22,7 @@ try:
 except Exception:
     pytesseract = None
 
-st.set_page_config(page_title="GG2+ Daily Picks", page_icon="⚽", layout="centered")
-st.title("⚽ GG2+ Daily Picks")
-st.markdown("**Matches where both teams may score at least 2 goals each**")
-st.markdown("---")
+st.set_page_config(page_title="GG Predictor", page_icon="⚽", layout="centered")
 
 LEAGUE_NAMES = {
     "E0": "England - Premier League", "E1": "England - Championship",
@@ -38,7 +38,6 @@ LEAGUE_NAMES = {
     "T1": "Turkey - Super Lig", "G1": "Greece - Super League",
     "Brazil": "Brazil - Serie A", "USA": "USA - MLS",
 }
-
 ESPN_LEAGUES = {
     "bra.1": "Brazil", "usa.1": "USA", "swe.1": "Sweden", "nor.1": "Norway",
     "den.1": "Denmark", "sui.1": "Switzerland", "aut.1": "Austria",
@@ -53,15 +52,32 @@ ESPN_CUPS = {
     "uefa.champions": "Champions League", "uefa.europa": "Europa League",
     "uefa.europa.conf": "Conference League",
 }
-
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-BUCKET = int(time.time() // 21600)  # refresh live data every 6 hours
+BUCKET = int(time.time() // 21600)
+BASE_RATE = 1.35
+HIST_PATH = os.path.join(tempfile.gettempdir(), "gg2plus_history.json")
 
 
+# ---------------- Helpers ----------------
 def clean(s):
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
     s = re.sub(r"[^a-z0-9 ]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+NOISE = {"fc", "wfc", "women", "womens", "ladies", "lionesses", "w", "afc",
+         "cf", "sc", "club", "ac", "fk", "sk", "bk", "if", "the"}
+WOMEN_RE = re.compile(r"\b(women|womens|wfc|ladies|lionesses|feminin\w*|frauen)\b", re.I)
+
+
+def is_women(name):
+    n = str(name).strip()
+    return bool(WOMEN_RE.search(n)) or bool(re.search(r"\bW$", n))
+
+
+def prob_k(lh, la, k):
+    """Chance both teams score at least k goals (k=1 is GG, k=2 is GG2+)."""
+    return float((1 - poisson.cdf(k - 1, lh)) * (1 - poisson.cdf(k - 1, la)))
 
 
 @st.cache_data
@@ -118,8 +134,7 @@ if results is None:
     st.stop()
 strengths = build_strengths(results)
 
-team_index = {}
-div_index = {}
+team_index, div_index = {}, {}
 for _div, (_att, _dfn, _h, _a) in strengths.items():
     div_index[_div] = {}
     for _t in _att:
@@ -139,13 +154,24 @@ def find_team(name, div=None, cutoff=0.75):
     return pool[best[0]] if best else None
 
 
-def two_plus(lam_h, lam_a):
-    p_h = 1 - poisson.pmf(0, lam_h) - poisson.pmf(1, lam_h)
-    p_a = 1 - poisson.pmf(0, lam_a) - poisson.pmf(1, lam_a)
-    return p_h * p_a
+def loose_find(name):
+    toks = [t for t in clean(name).split() if t not in NOISE]
+    c2 = " ".join(toks)
+    if len(c2) < 3:
+        return None
+    t = find_team(c2, None, 0.8)
+    if t:
+        return t
+    padded = f" {c2} "
+    best = None
+    for key, val in team_index.items():
+        if len(key) >= 4 and f" {key} " in padded:
+            if best is None or len(key) > len(best[0]):
+                best = (key, val)
+    return best[1] if best else None
 
 
-def pair_prob(h, a):
+def file_lams(h, a):
     hd, ht = h
     ad, at = a
     att_h = strengths[hd][0].get(ht, 1.0)
@@ -157,147 +183,11 @@ def pair_prob(h, a):
     else:
         avg_h = (strengths[hd][2] + strengths[ad][2]) / 2
         avg_a = (strengths[hd][3] + strengths[ad][3]) / 2
-    lam_h = float(np.clip(att_h * def_a * avg_h, 0.35, 3.2))
-    lam_a = float(np.clip(att_a * def_h * avg_a, 0.25, 2.8))
-    return two_plus(lam_h, lam_a), lam_h, lam_a
+    return (float(np.clip(att_h * def_a * avg_h, 0.35, 3.2)),
+            float(np.clip(att_a * def_h * avg_a, 0.25, 2.8)))
 
 
-@st.cache_data(ttl=3600)
-def load_euro_fixtures():
-    fx = pd.read_csv("https://football-data.co.uk/fixtures.csv", encoding="latin-1")
-    fx = fx.dropna(subset=["HomeTeam", "AwayTeam"])
-    fx["Date"] = pd.to_datetime(fx["Date"], dayfirst=True, errors="coerce")
-    return fx.dropna(subset=["Date"])[["Div", "Date", "HomeTeam", "AwayTeam"]]
-
-
-@st.cache_data(ttl=1800)
-def load_espn(start, end):
-    rng = start if start == end else f"{start}-{end}"
-    jobs = [(c, n, False) for c, n in ESPN_LEAGUES.items()] + \
-           [(c, n, True) for c, n in ESPN_CUPS.items()]
-
-    def fetch(job):
-        code, label, is_cup = job
-        url = ("https://site.api.espn.com/apis/site/v2/sports/soccer/"
-               f"{code}/scoreboard?dates={rng}&limit=300")
-        rows = []
-        try:
-            data = requests.get(url, timeout=8).json()
-        except Exception:
-            return rows
-        for e in data.get("events", []):
-            try:
-                if e["status"]["type"]["state"] != "pre":
-                    continue
-                comp = e["competitions"][0]["competitors"]
-                home = next(c for c in comp if c["homeAway"] == "home")
-                away = next(c for c in comp if c["homeAway"] == "away")
-                date = pd.to_datetime(e["date"], utc=True).tz_convert(None).normalize()
-                rows.append({
-                    "Div": label, "Comp": label, "Cup": is_cup, "Date": date,
-                    "HomeTeam": home["team"]["displayName"],
-                    "AwayTeam": away["team"]["displayName"],
-                })
-            except Exception:
-                continue
-        return rows
-
-    with ThreadPoolExecutor(8) as ex:
-        out = list(ex.map(fetch, jobs))
-    return [r for part in out for r in part]
-
-
-# ---------------- Daily picks ----------------
-st.header("📅 Daily picks")
-choice = st.radio("Show picks for", ["Today", "Tomorrow", "Next 3 days", "Next 7 days"],
-                  horizontal=True)
-min_prob = st.slider("Minimum GG2+ chance (%)", 8, 30, 14)
-
-today = pd.Timestamp.today().normalize()
-if choice == "Today":
-    start, end = today, today
-elif choice == "Tomorrow":
-    start = end = today + pd.Timedelta(days=1)
-elif choice == "Next 3 days":
-    start, end = today, today + pd.Timedelta(days=3)
-else:
-    start, end = today, today + pd.Timedelta(days=7)
-
-fx_rows = []
-try:
-    euro = load_euro_fixtures()
-    euro = euro[(euro["Date"] >= start) & (euro["Date"] <= end)]
-    for _, r in euro.iterrows():
-        fx_rows.append({"Div": r["Div"], "Comp": LEAGUE_NAMES.get(r["Div"], r["Div"]),
-                        "Cup": False, "Date": r["Date"],
-                        "HomeTeam": r["HomeTeam"], "AwayTeam": r["AwayTeam"]})
-except Exception:
-    st.caption("Could not load the European fixtures right now.")
-fx_rows += load_espn(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
-
-scored, skipped, counts = [], [], {}
-for r in fx_rows:
-    comp = LEAGUE_NAMES.get(r["Comp"], r["Comp"])
-    counts.setdefault(comp, [0, 0])
-    counts[comp][0] += 1
-    note = ""
-    if r["Cup"]:
-        h = find_team(r["HomeTeam"], None, 0.85)
-        a = find_team(r["AwayTeam"], None, 0.85)
-    elif r["Div"] in strengths:
-        h = find_team(r["HomeTeam"], r["Div"], 0.7)
-        a = find_team(r["AwayTeam"], r["Div"], 0.7)
-        if h or a:
-            if not h:
-                h, note = (r["Div"], None), "home team estimated"
-            if not a:
-                a, note = (r["Div"], None), "away team estimated"
-    else:
-        h = a = None
-    if not h or not a or h == a:
-        skipped.append(f"{comp}: {r['HomeTeam']} v {r['AwayTeam']}")
-        continue
-    prob, lh, la = pair_prob(h, a)
-    counts[comp][1] += 1
-    scored.append({
-        "Date": r["Date"].strftime("%d %b"),
-        "Competition": comp,
-        "Home": r["HomeTeam"], "Away": r["AwayTeam"],
-        "GG2+ chance %": round(prob * 100, 1),
-        "Exp. goals": f"{lh:.1f} - {la:.1f}",
-        "Note": note,
-    })
-
-if not scored:
-    st.warning("No matches could be rated for this period. Try 'Next 7 days'.")
-else:
-    df_s = pd.DataFrame(scored).sort_values("GG2+ chance %", ascending=False)
-    strong = df_s[df_s["GG2+ chance %"] >= min_prob].head(10)
-    if strong.empty:
-        st.info(f"No strong GG2+ matches for this period. None reach {min_prob}%. "
-                f"The highest is {df_s['GG2+ chance %'].iloc[0]}%. "
-                "Better to skip than force a pick.")
-    else:
-        st.subheader(f"Top {len(strong)} picks")
-        st.dataframe(strong, hide_index=True, use_container_width=True)
-    st.caption(f"{len(scored)} matches rated, {len(skipped)} skipped.")
-
-with st.expander("🔍 Diagnostics: which leagues were found"):
-    if counts:
-        diag = pd.DataFrame(
-            [{"Competition": k, "Matches found": v[0], "Matches rated": v[1]}
-             for k, v in sorted(counts.items())])
-        st.dataframe(diag, hide_index=True, use_container_width=True)
-    else:
-        st.write("No fixtures were returned by any source for these dates.")
-    if skipped:
-        st.write("Skipped matches:")
-        st.write("\n".join(f"- {s}" for s in skipped[:40]))
-
-# ---------------- Live team lookup (for your own list) ----------------
-BASE_RATE = 1.35  # average goals per team per game, used to steady small samples
-
-
+# ---------------- Live team lookup ----------------
 def _walk(o):
     if isinstance(o, dict):
         yield o
@@ -324,7 +214,7 @@ def search_query(name):
     return re.sub(r"\s+", " ", q).strip()
 
 
-def _is_women_name(n):
+def _women_name(n):
     n = str(n).lower()
     return "women" in n or bool(re.search(r"\bw$", n.strip()))
 
@@ -352,8 +242,7 @@ def espn_team_id(name, women, bucket):
             if not m or not nm or m.group(1) in seen:
                 continue
             seen.add(m.group(1))
-            cw = _is_women_name(nm)
-            if women != cw:
+            if women != _women_name(nm):
                 continue
             score = difflib.SequenceMatcher(None, search_query(nm), q).ratio()
             if score > best[0]:
@@ -404,53 +293,127 @@ def live_stats(key, bucket):
     g = espn_recent(tid, bucket)
     if len(g) < 4:
         return None
-    n = len(g)
-    k = 3
-    scored_ = sum(x[1] for x in g)
-    conceded_ = sum(x[2] for x in g)
-    return ((scored_ + k * BASE_RATE) / (n + k),
-            (conceded_ + k * BASE_RATE) / (n + k), n)
+    n, k = len(g), 3
+    sc = sum(x[1] for x in g)
+    co = sum(x[2] for x in g)
+    return ((sc + k * BASE_RATE) / (n + k), (co + k * BASE_RATE) / (n + k), n)
 
 
-def live_prob(sh, sa):
-    lam_h = float(np.clip((sh[0] + sa[1]) / 2 * 1.08, 0.35, 3.2))
-    lam_a = float(np.clip((sa[0] + sh[1]) / 2 * 0.95, 0.25, 2.8))
-    return two_plus(lam_h, lam_a), lam_h, lam_a
+def live_lams(sh, sa):
+    return (float(np.clip((sh[0] + sa[1]) / 2 * 1.08, 0.35, 3.2)),
+            float(np.clip((sa[0] + sh[1]) / 2 * 0.95, 0.25, 2.8)))
 
 
-# ---------------- Pictures / pasted list ----------------
-st.markdown("---")
-st.header("📷 Check your own list")
-st.markdown("Upload screenshots or paste a list. The app looks up each team's "
-            "recent results and shows your best 7 matches.")
-
-NOISE = {"fc", "wfc", "women", "womens", "ladies", "lionesses", "w", "afc",
-         "cf", "sc", "club", "ac", "fk", "sk", "bk", "if", "the"}
-WOMEN_RE = re.compile(r"\b(women|womens|wfc|ladies|lionesses|feminin\w*|frauen)\b", re.I)
+# ---------------- Fixtures ----------------
+@st.cache_data(ttl=3600)
+def load_euro_fixtures():
+    fx = pd.read_csv("https://football-data.co.uk/fixtures.csv", encoding="latin-1")
+    fx = fx.dropna(subset=["HomeTeam", "AwayTeam"])
+    fx["Date"] = pd.to_datetime(fx["Date"], dayfirst=True, errors="coerce")
+    return fx.dropna(subset=["Date"])[["Div", "Date", "HomeTeam", "AwayTeam"]]
 
 
-def is_women(name):
-    n = str(name).strip()
-    return bool(WOMEN_RE.search(n)) or bool(re.search(r"\bW$", n))
+@st.cache_data(ttl=1800)
+def load_espn(start, end):
+    rng = start if start == end else f"{start}-{end}"
+    jobs = [(c, n, False) for c, n in ESPN_LEAGUES.items()] + \
+           [(c, n, True) for c, n in ESPN_CUPS.items()]
+
+    def fetch(job):
+        code, label, is_cup = job
+        url = ("https://site.api.espn.com/apis/site/v2/sports/soccer/"
+               f"{code}/scoreboard?dates={rng}&limit=300")
+        rows = []
+        try:
+            data = requests.get(url, timeout=8).json()
+        except Exception:
+            return rows
+        for e in data.get("events", []):
+            try:
+                if e["status"]["type"]["state"] != "pre":
+                    continue
+                comp = e["competitions"][0]["competitors"]
+                home = next(c for c in comp if c["homeAway"] == "home")
+                away = next(c for c in comp if c["homeAway"] == "away")
+                date = pd.to_datetime(e["date"], utc=True).tz_convert(None).normalize()
+                rows.append({
+                    "Div": label, "Comp": label, "Cup": is_cup, "Date": date,
+                    "HomeTeam": home["team"]["displayName"],
+                    "AwayTeam": away["team"]["displayName"],
+                })
+            except Exception:
+                continue
+        return rows
+
+    with ThreadPoolExecutor(8) as ex:
+        out = list(ex.map(fetch, jobs))
+    return [r for part in out for r in part]
 
 
-def loose_find(name):
-    toks = [t for t in clean(name).split() if t not in NOISE]
-    c2 = " ".join(toks)
-    if len(c2) < 3:
-        return None
-    t = find_team(c2, None, 0.8)
-    if t:
-        return t
-    padded = f" {c2} "
-    best = None
-    for key, val in team_index.items():
-        if len(key) >= 4 and f" {key} " in padded:
-            if best is None or len(key) > len(best[0]):
-                best = (key, val)
-    return best[1] if best else None
+# ---------------- History ----------------
+def load_history():
+    try:
+        with open(HIST_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return []
 
 
+def save_history(h):
+    try:
+        with open(HIST_PATH, "w") as f:
+            json.dump(h, f)
+    except Exception:
+        pass
+
+
+def add_history(entries):
+    hist = load_history()
+    keys = {e["key"] for e in hist}
+    new = [e for e in entries if e["key"] not in keys]
+    if new:
+        save_history(hist + new)
+
+
+def outcome(e):
+    s = e.get("score")
+    if not s:
+        return "⏳"
+    try:
+        h, a = (int(x) for x in s.split("-"))
+    except Exception:
+        return "⏳"
+    k = 2 if e["market"] == "GG2+" else 1
+    return "✅" if h >= k and a >= k else "❌"
+
+
+def check_results(hist):
+    changed = 0
+    today = pd.Timestamp.today().normalize()
+    fresh = int(time.time())
+    for e in hist:
+        if e.get("score"):
+            continue
+        md = pd.Timestamp(e["match_date"])
+        if md > today:
+            continue
+        women = is_women(e["home"]) or is_women(e["away"])
+        tid = espn_team_id(e["home"], women, BUCKET)
+        if not tid:
+            continue
+        for date, mine, opp in espn_recent(tid, fresh):
+            try:
+                gd = pd.to_datetime(date, utc=True).tz_convert(None).normalize()
+            except Exception:
+                continue
+            if md <= gd <= md + pd.Timedelta(days=4):
+                e["score"] = f"{int(mine)}-{int(opp)}"
+                changed += 1
+                break
+    return changed
+
+
+# ---------------- Slip reading ----------------
 @st.cache_data
 def ocr_image(data: bytes):
     im = Image.open(io.BytesIO(data)).convert("L")
@@ -481,98 +444,274 @@ def parse_matches(txt):
     return out
 
 
-ups = st.file_uploader("Upload pictures of the matches (you can pick several)",
-                       type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-pasted = st.text_area("Or paste the list here (one match per line, like: Arsenal v Chelsea)",
-                      height=120)
+# ---------------- Sidebar settings ----------------
+with st.sidebar:
+    st.header("Settings")
+    min2 = st.slider("GG2+ counts as strong from (%)", 8, 30, 14)
+    min1 = st.slider("GG counts as strong from (%)", 30, 80, 50)
+MARKETS = {"GG2+": (2, min2), "GG": (1, min1)}
+CHANCE_CFG = {"Chance %": st.column_config.ProgressColumn(
+    "Chance", min_value=0, max_value=100, format="%.1f%%")}
 
-texts = [pasted] if pasted.strip() else []
-if ups:
-    if pytesseract is None:
-        st.warning("Picture reading is not installed yet. Paste the list instead.")
-    else:
-        read_ok, read_fail = 0, []
-        for f in ups:
-            try:
-                texts.append(ocr_image(f.getvalue()))
-                read_ok += 1
-            except Exception as e:
-                read_fail.append(f"{f.name} ({type(e).__name__}: {e})")
-        st.caption(f"{read_ok} of {len(ups)} pictures read.")
-        if read_fail:
-            st.warning("Could not read: " + ", ".join(read_fail))
 
-if texts:
-    with st.expander("What the app read from the pictures"):
-        st.text("\n\n-----\n\n".join(texts))
+def market_table(df, mkt):
+    k, mn = MARKETS[mkt]
+    out = df.copy()
+    out["Chance %"] = [round(prob_k(a, b, k) * 100, 1)
+                       for a, b in zip(out["lh"], out["la"])]
+    out["Verdict"] = np.where(out["Chance %"] >= mn, "Strong", "Weak")
+    out["Exp. goals"] = [f"{a:.1f} - {b:.1f}" for a, b in zip(out["lh"], out["la"])]
+    return out.sort_values("Chance %", ascending=False)
 
-    parsed, seen_pairs = [], set()
-    for t in texts:
-        for pair in parse_matches(t):
-            if pair not in seen_pairs:
-                seen_pairs.add(pair)
-                parsed.append(pair)
 
-    with st.expander(f"{len(parsed)} matches found (tap to fix mistakes)"):
-        base = pd.DataFrame(parsed, columns=["Home", "Away"])
-        edited = st.data_editor(base, num_rows="dynamic", use_container_width=True,
-                                key=f"ed_{len(parsed)}_{len(ups) if ups else 0}")
+# ---------------- Page ----------------
+st.title("⚽ GG Predictor")
+tab_slip, tab_daily, tab_hist = st.tabs(["📷 My slip", "📅 Daily picks", "🕘 History"])
 
-    pairs = [(str(r["Home"]), str(r["Away"])) for _, r in edited.dropna().iterrows()]
-    keys = sorted({(n, is_women(h) or is_women(a)) for h, a in pairs for n in (h, a)})
+# ======== My slip ========
+with tab_slip:
+    ups = st.file_uploader("Upload slip pictures", type=["png", "jpg", "jpeg"],
+                           accept_multiple_files=True)
+    pasted = st.text_area("Or paste matches (Arsenal v Chelsea, one per line)", height=90)
 
-    with st.spinner("Looking up recent results for each team..."):
-        with ThreadPoolExecutor(8) as ex:
-            stats = dict(zip(keys, ex.map(lambda k: live_stats(k, BUCKET), keys)))
-
-    rows, unrated = [], []
-    for hn, an in pairs:
-        women = is_women(hn) or is_women(an)
-        sh, sa = stats.get((hn, women)), stats.get((an, women))
-        if sh and sa:
-            prob, lh, la = live_prob(sh, sa)
-            data_src = f"Live results ({sh[2]}+{sa[2]} games)"
+    texts = [pasted] if pasted.strip() else []
+    if ups:
+        if pytesseract is None:
+            st.warning("Picture reading is not installed. Paste the list instead.")
         else:
-            h = None if women else loose_find(hn)
-            a = None if women else loose_find(an)
-            if h and a and h != a:
-                prob, lh, la = pair_prob(h, a)
-                data_src = "League files"
+            fails = []
+            for f in ups:
+                try:
+                    texts.append(ocr_image(f.getvalue()))
+                except Exception as e:
+                    fails.append(f"{f.name} ({type(e).__name__})")
+            if fails:
+                st.warning("Could not read: " + ", ".join(fails))
+
+    if texts:
+        parsed, seen_pairs = [], set()
+        for t in texts:
+            for pair in parse_matches(t):
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    parsed.append(pair)
+
+        with st.expander(f"{len(parsed)} matches found (fix mistakes here)"):
+            base = pd.DataFrame(parsed, columns=["Home", "Away"])
+            edited = st.data_editor(base, num_rows="dynamic", use_container_width=True,
+                                    key=f"ed_{len(parsed)}_{len(ups) if ups else 0}")
+            if st.checkbox("Show raw text read from the pictures"):
+                st.text("\n\n-----\n\n".join(texts))
+
+        pairs = [(str(r["Home"]), str(r["Away"])) for _, r in edited.dropna().iterrows()]
+        keys = sorted({(n, is_women(h) or is_women(a)) for h, a in pairs for n in (h, a)})
+        with st.spinner("Looking up each team..."):
+            with ThreadPoolExecutor(8) as ex:
+                stats = dict(zip(keys, ex.map(lambda k: live_stats(k, BUCKET), keys)))
+
+        rows, unrated = [], []
+        for hn, an in pairs:
+            women = is_women(hn) or is_women(an)
+            sh, sa = stats.get((hn, women)), stats.get((an, women))
+            if sh and sa:
+                lh, la = live_lams(sh, sa)
+                src = "Live results"
             else:
-                unrated.append(f"{hn} v {an}")
-                continue
-        rows.append({"Home": hn, "Away": an,
-                     "GG2+ chance %": round(prob * 100, 1),
-                     "Exp. goals": f"{lh:.1f} - {la:.1f}",
-                     "Verdict": "Strong" if prob * 100 >= min_prob else "Weak",
-                     "Data": data_src})
+                h = None if women else loose_find(hn)
+                a = None if women else loose_find(an)
+                if h and a and h != a:
+                    lh, la = file_lams(h, a)
+                    src = "League files"
+                else:
+                    unrated.append(f"{hn} v {an}")
+                    continue
+            rows.append({"Home": hn, "Away": an, "lh": lh, "la": la, "Data": src})
 
-    if rows:
-        df_all = pd.DataFrame(rows).sort_values("GG2+ chance %", ascending=False)
-        top7 = df_all.head(7)
-        st.subheader("Best 7 from your list")
-        st.dataframe(top7, hide_index=True, use_container_width=True)
-        n_strong = int((top7["Verdict"] == "Strong").sum())
-        if n_strong == 0:
-            st.info(f"None of these reach {min_prob}%. These are the best of a weak "
-                    "list, so skipping is reasonable.")
-        st.caption(f"{len(rows)} of {len(pairs)} matches rated.")
-        with st.expander("All rated matches"):
-            st.dataframe(df_all, hide_index=True, use_container_width=True)
+        if not rows:
+            st.warning("None of the matches could be rated. Check the spelling above.")
+        else:
+            df_slip = pd.DataFrame(rows)
+            t2, t1 = st.tabs(["🎯 GG2+ · best 7", "⚽ GG · best 7"])
+            today_iso = pd.Timestamp.today().normalize().strftime("%Y-%m-%d")
+            entries = []
+            for tab, mkt in ((t2, "GG2+"), (t1, "GG")):
+                with tab:
+                    top = market_table(df_slip, mkt).head(7)
+                    st.dataframe(top[["Home", "Away", "Chance %", "Exp. goals",
+                                      "Verdict", "Data"]],
+                                 hide_index=True, use_container_width=True,
+                                 column_config=CHANCE_CFG)
+                    if (top["Verdict"] == "Strong").sum() == 0:
+                        st.info("None reach your minimum chance. Skipping is reasonable.")
+                for _, r in top.iterrows():
+                    entries.append({
+                        "key": f"slip|{mkt}|{today_iso}|{r['Home']}|{r['Away']}",
+                        "saved": today_iso, "match_date": today_iso, "source": "Slip",
+                        "market": mkt, "home": r["Home"], "away": r["Away"],
+                        "chance": float(r["Chance %"]), "score": None})
+            add_history(entries)
+            st.caption(f"{len(rows)} of {len(pairs)} matches rated. Saved to History.")
+        if unrated:
+            with st.expander(f"{len(unrated)} not rated"):
+                st.write("No recent results were found for one of the teams.")
+                st.write("\n".join(f"- {u}" for u in unrated))
+
+# ======== Daily picks ========
+with tab_daily:
+    choice = st.radio("Period", ["Today", "Tomorrow", "Next 3 days", "Next 7 days"],
+                      horizontal=True, label_visibility="collapsed")
+    today = pd.Timestamp.today().normalize()
+    if choice == "Today":
+        start, end = today, today
+    elif choice == "Tomorrow":
+        start = end = today + pd.Timedelta(days=1)
+    elif choice == "Next 3 days":
+        start, end = today, today + pd.Timedelta(days=3)
     else:
-        st.warning("None of the matches could be rated.")
-    if unrated:
-        with st.expander(f"{len(unrated)} matches could not be rated"):
-            st.write("No recent results were found for one of the teams in these "
-                     "matches. Check the spelling in the table above.")
-            st.write("\n".join(f"- {u}" for u in unrated))
+        start, end = today, today + pd.Timedelta(days=7)
 
-st.markdown("---")
-st.markdown("""
-**What is GG2+?**  
-Both teams score **at least 2 goals each** (examples: 2-2, 3-2, 2-3, 4-2).
+    fx_rows = []
+    try:
+        euro = load_euro_fixtures()
+        euro = euro[(euro["Date"] >= start) & (euro["Date"] <= end)]
+        for _, r in euro.iterrows():
+            fx_rows.append({"Div": r["Div"], "Comp": LEAGUE_NAMES.get(r["Div"], r["Div"]),
+                            "Cup": False, "Date": r["Date"],
+                            "HomeTeam": r["HomeTeam"], "AwayTeam": r["AwayTeam"]})
+    except Exception:
+        st.caption("European fixtures could not be loaded right now.")
+    fx_rows += load_espn(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
 
-**How the picks are made**  
-The app reads each team's recent results, estimates the goals for the match
-with a Poisson model, and ranks matches by the chance of GG2+.
+    drows, skipped, counts = [], [], {}
+    for r in fx_rows:
+        comp = LEAGUE_NAMES.get(r["Comp"], r["Comp"])
+        counts.setdefault(comp, [0, 0])
+        counts[comp][0] += 1
+        if r["Cup"]:
+            h = find_team(r["HomeTeam"], None, 0.85)
+            a = find_team(r["AwayTeam"], None, 0.85)
+        elif r["Div"] in strengths:
+            h = find_team(r["HomeTeam"], r["Div"], 0.7)
+            a = find_team(r["AwayTeam"], r["Div"], 0.7)
+            if h or a:
+                h = h or (r["Div"], None)
+                a = a or (r["Div"], None)
+        else:
+            h = a = None
+        if not h or not a or h == a:
+            skipped.append(f"{comp}: {r['HomeTeam']} v {r['AwayTeam']}")
+            continue
+        lh, la = file_lams(h, a)
+        counts[comp][1] += 1
+        drows.append({"Date": r["Date"].strftime("%d %b"),
+                      "iso": r["Date"].strftime("%Y-%m-%d"),
+                      "Competition": comp, "Home": r["HomeTeam"], "Away": r["AwayTeam"],
+                      "lh": lh, "la": la})
+
+    if not drows:
+        st.info("No rated matches for this period. Try a longer period.")
+    else:
+        df_d = pd.DataFrame(drows)
+        d2, d1 = st.tabs(["🎯 GG2+ · top 10", "⚽ GG · top 10"])
+        entries = []
+        for tab, mkt in ((d2, "GG2+"), (d1, "GG")):
+            _, mn = MARKETS[mkt]
+            with tab:
+                full = market_table(df_d, mkt)
+                strong = full[full["Chance %"] >= mn].head(10)
+                if strong.empty:
+                    st.info(f"No strong {mkt} matches for this period. "
+                            f"The highest is {full['Chance %'].iloc[0]}%. "
+                            "Better to skip than force a pick.")
+                else:
+                    st.dataframe(strong[["Date", "Competition", "Home", "Away",
+                                         "Chance %", "Exp. goals"]],
+                                 hide_index=True, use_container_width=True,
+                                 column_config=CHANCE_CFG)
+                for _, r in strong.iterrows():
+                    entries.append({
+                        "key": f"daily|{mkt}|{r['iso']}|{r['Home']}|{r['Away']}",
+                        "saved": today.strftime("%Y-%m-%d"), "match_date": r["iso"],
+                        "source": "Daily", "market": mkt, "home": r["Home"],
+                        "away": r["Away"], "chance": float(r["Chance %"]),
+                        "score": None})
+        add_history(entries)
+        st.caption(f"{len(drows)} matches rated.")
+
+    with st.expander("Leagues checked"):
+        if counts:
+            st.dataframe(pd.DataFrame(
+                [{"Competition": k, "Found": v[0], "Rated": v[1]}
+                 for k, v in sorted(counts.items())]),
+                hide_index=True, use_container_width=True)
+        else:
+            st.write("No fixtures returned for these dates.")
+        if skipped:
+            st.write("Not rated:")
+            st.write("\n".join(f"- {s}" for s in skipped[:40]))
+
+# ======== History ========
+with tab_hist:
+    hist = load_history()
+    c1, c2 = st.columns(2)
+    if c1.button("🔄 Check results", use_container_width=True):
+        with st.spinner("Looking up final scores..."):
+            n = check_results(hist)
+            save_history(hist)
+        st.success(f"{n} results found.")
+        hist = load_history()
+    if hist:
+        hdf = pd.DataFrame(hist)
+        hdf["Result"] = hdf["score"].fillna("")
+        hdf["Outcome"] = [outcome(e) for e in hist]
+        hdf["Match"] = hdf["home"] + " v " + hdf["away"]
+        hdf = hdf.sort_values(["match_date", "chance"], ascending=[False, False])
+
+        m1, m2 = st.columns(2)
+        for col, mkt in ((m1, "GG2+"), (m2, "GG")):
+            sub = hdf[(hdf["market"] == mkt) & (hdf["Outcome"] != "⏳")]
+            hits = int((sub["Outcome"] == "✅").sum())
+            col.metric(f"{mkt} hit rate",
+                       f"{hits}/{len(sub)}" if len(sub) else "–",
+                       f"{hits / len(sub) * 100:.0f}%" if len(sub) else None,
+                       delta_color="off")
+
+        f_mkt = st.radio("Show", ["All", "GG2+", "GG"], horizontal=True)
+        view = hdf if f_mkt == "All" else hdf[hdf["market"] == f_mkt]
+        st.dataframe(view.rename(columns={"match_date": "Date", "market": "Market",
+                                          "source": "From", "chance": "Chance %"})[
+            ["Date", "Market", "From", "Match", "Chance %", "Result", "Outcome"]],
+            hide_index=True, use_container_width=True, column_config=CHANCE_CFG)
+        c2.download_button("⬇️ Download", hdf.to_csv(index=False).encode(),
+                           "gg_history.csv", "text/csv", use_container_width=True)
+    else:
+        st.info("Nothing saved yet. Picks and slip results appear here automatically.")
+
+    with st.expander("Restore saved history"):
+        up_h = st.file_uploader("Upload a downloaded history file (.csv)", type=["csv"],
+                                key="hist_up")
+        if up_h is not None:
+            try:
+                old = pd.read_csv(up_h)
+                recs = []
+                for _, r in old.iterrows():
+                    recs.append({
+                        "key": str(r["key"]), "saved": str(r["saved"]),
+                        "match_date": str(r["match_date"]), "source": str(r["source"]),
+                        "market": str(r["market"]), "home": str(r["home"]),
+                        "away": str(r["away"]), "chance": float(r["chance"]),
+                        "score": None if pd.isna(r.get("score")) else str(r["score"])})
+                add_history(recs)
+                st.success(f"{len(recs)} rows restored. Reload the page to see them.")
+            except Exception:
+                st.error("That file could not be read.")
+    st.caption("History is kept on the app server. It is cleared when the app "
+               "restarts or when you change the code. Download it regularly.")
+
+with st.expander("How it works"):
+    st.markdown("""
+**GG2+** means both teams score at least 2 goals each. **GG** means both teams
+score at least 1. The app estimates each team's goals from recent results with a
+Poisson model, then works out the chance of each result. These are chances, not
+guarantees.
 """)
