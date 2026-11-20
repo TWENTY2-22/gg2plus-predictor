@@ -89,6 +89,7 @@ BUCKET = int(time.time() // 21600)   # team data: refreshed every 6 hours
 RB = int(time.time() // 600)         # results: refreshed every 10 minutes
 BASE_RATE = 1.35
 HIST_PATH = os.path.join(tempfile.gettempdir(), "gg_history_v2.json")
+SNAP_PATH = os.path.join(tempfile.gettempdir(), "gg_daily_snap.json")
 ONE_DAY = pd.Timedelta(days=1)
 
 
@@ -450,7 +451,7 @@ def live_lams(sh, sa):
 
 
 # ---------------- Fixtures and results (ESPN) ----------------
-@st.cache_data(ttl=1200)
+@st.cache_data(ttl=600)
 def load_espn(start, end):
     rng = start if start == end else f"{start}-{end}"
 
@@ -494,21 +495,37 @@ def load_espn(start, end):
     return [r for part in out for r in part]
 
 
-# ---------------- History ----------------
-def load_history():
+# ---------------- Saved files ----------------
+def _load(path, default):
     try:
-        with open(HIST_PATH) as f:
+        with open(path) as f:
             return json.load(f)
     except Exception:
-        return []
+        return default
+
+
+def _save(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def load_history():
+    return _load(HIST_PATH, [])
 
 
 def save_history(h):
-    try:
-        with open(HIST_PATH, "w") as f:
-            json.dump(h, f)
-    except Exception:
-        pass
+    _save(HIST_PATH, h)
+
+
+def load_snap():
+    return _load(SNAP_PATH, {})
+
+
+def save_snap(s):
+    _save(SNAP_PATH, s)
 
 
 def add_history(entries):
@@ -594,6 +611,47 @@ def add_chances(df):
     df["GG %"] = [round(prob_k(a, b, 1) * 100, 1) for a, b in zip(df["lh"], df["la"])]
     df["Exp. goals"] = [f"{a:.1f} - {b:.1f}" for a, b in zip(df["lh"], df["la"])]
     return df
+
+
+def rate_day(day_fx):
+    """Work out the chances for one day's matches (used once, then saved)."""
+    rated, pending = [], []
+    for r in day_fx:
+        lams = None
+        if r["Div"] and r["Div"] in strengths:
+            h = find_team(r["HomeTeam"], r["Div"], 0.7)
+            a = find_team(r["AwayTeam"], r["Div"], 0.7)
+            if h and a and h != a:
+                lams = (*file_lams(h, a), "League files")
+        elif r["Cup"]:
+            h = find_team(r["HomeTeam"], None, 0.85)
+            a = find_team(r["AwayTeam"], None, 0.85)
+            if h and a and h != a:
+                lams = (*file_lams(h, a), "League files")
+        if lams:
+            rated.append((r, lams))
+        else:
+            pending.append(r)
+    if pending:
+        ids = sorted({i for r in pending for i in (r["hid"], r["aid"]) if i})
+        with ThreadPoolExecutor(8) as ex:
+            list(ex.map(lambda t: id_stats(t, BUCKET), ids))
+        for r in pending:
+            sh, sa = id_stats(r["hid"], BUCKET), id_stats(r["aid"], BUCKET)
+            if sh and sa:
+                rated.append((r, (*live_lams(sh, sa), "Live results")))
+    stamp = time.strftime("%d %b %H:%M", time.gmtime())
+    rows = []
+    for r, (lh, la, src) in rated:
+        rows.append({
+            "Match": f"{r['HomeTeam']} v {r['AwayTeam']}",
+            "Home": r["HomeTeam"], "Away": r["AwayTeam"],
+            "Competition": r["Comp"], "lh": float(lh), "la": float(la),
+            "gg2": round(prob_k(lh, la, 2) * 100, 1),
+            "gg1": round(prob_k(lh, la, 1) * 100, 1),
+            "Data": src, "hid": r["hid"], "pre": r["state"] == "pre",
+            "locked": stamp})
+    return rows
 
 
 TODAY = pd.Timestamp.today().normalize()
@@ -724,53 +782,52 @@ with tab_daily:
         "Last 3 days": (TODAY - 3 * ONE_DAY, TODAY - ONE_DAY),
     }[period]
 
+    refresh = st.button("🔄 Refresh picks (replaces the saved list for these days)")
+
     with st.spinner("Loading matches..."):
         fx = load_espn(start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
-
-    rated, pending, counts = [], [], {}
+    by_date = {}
     for r in fx:
-        counts.setdefault(r["Comp"], [0, 0])
-        counts[r["Comp"]][0] += 1
-        lams = None
-        if r["Div"] and r["Div"] in strengths:
-            h = find_team(r["HomeTeam"], r["Div"], 0.7)
-            a = find_team(r["AwayTeam"], r["Div"], 0.7)
-            if h and a and h != a:
-                lams = (*file_lams(h, a), "League files")
-        elif r["Cup"]:
-            h = find_team(r["HomeTeam"], None, 0.85)
-            a = find_team(r["AwayTeam"], None, 0.85)
-            if h and a and h != a:
-                lams = (*file_lams(h, a), "League files")
-        if lams:
-            rated.append((r, lams))
-        else:
-            pending.append(r)
+        by_date.setdefault(r["Date"].strftime("%Y-%m-%d"), []).append(r)
 
-    if pending:
-        ids = sorted({i for r in pending for i in (r["hid"], r["aid"]) if i})
-        with st.spinner("Fetching recent results for teams..."):
-            with ThreadPoolExecutor(8) as ex:
-                list(ex.map(lambda t: id_stats(t, BUCKET), ids))
-        for r in pending:
-            sh, sa = id_stats(r["hid"], BUCKET), id_stats(r["aid"], BUCKET)
-            if sh and sa:
-                rated.append((r, (*live_lams(sh, sa), "Live results")))
-
+    snap = load_snap()
+    snap_changed = False
     drows = []
-    for r, (lh, la, src) in rated:
-        counts[r["Comp"]][1] += 1
-        drows.append({
-            "Match": f"{r['HomeTeam']} v {r['AwayTeam']}",
-            "Home": r["HomeTeam"], "Away": r["AwayTeam"],
-            "Date": r["Date"].strftime("%d %b"), "iso": r["Date"].strftime("%Y-%m-%d"),
-            "Competition": r["Comp"], "lh": lh, "la": la, "Data": src,
-            "Score": r["score"] or "", "state": r["state"], "hid": r["hid"]})
+    with st.spinner("Preparing picks..."):
+        for d in pd.date_range(start, end):
+            iso = d.strftime("%Y-%m-%d")
+            day_fx = by_date.get(iso, [])
+            entry = snap.get(iso)
+            if (entry is None or refresh) and day_fx:
+                rows_ = rate_day(day_fx)
+                if rows_:
+                    entry = {"rough": bool(d < TODAY), "rows": rows_}
+                    snap[iso] = entry
+                    snap_changed = True
+            if not entry:
+                continue
+            live = {f"{r['HomeTeam']} v {r['AwayTeam']}": r for r in day_fx}
+            for row in entry["rows"]:
+                lv = live.get(row["Match"])
+                drows.append({**row, "iso": iso, "Date": d.strftime("%d %b"),
+                              "Score": (lv["score"] if lv and lv["score"] else ""),
+                              "rough": entry.get("rough", False)})
+    if snap_changed:
+        save_snap(snap)
+
+    counts = {}
+    for r in fx:
+        counts.setdefault(r["Comp"], [0, 0])[0] += 1
+    for r in drows:
+        counts.setdefault(r["Competition"], [0, 0])[1] += 1
 
     if not drows:
         st.info("No rated matches for this period. Try a different period.")
     else:
-        df_d = add_chances(pd.DataFrame(drows))
+        df_d = pd.DataFrame(drows)
+        df_d["GG2+ %"] = df_d["gg2"]
+        df_d["GG %"] = df_d["gg1"]
+        df_d["Exp. goals"] = [f"{a:.1f} - {b:.1f}" for a, b in zip(df_d["lh"], df_d["la"])]
         df_d["GG2+ result"] = [result_icon(s, 2) for s in df_d["Score"]]
         df_d["GG result"] = [result_icon(s, 1) for s in df_d["Score"]]
 
@@ -795,14 +852,16 @@ with tab_daily:
                                "GG result", "Date", "Competition", "Exp. goals"]],
                          hide_index=True, use_container_width=True,
                          column_config={"GG2+ %": CFG2, "GG %": CFG1})
-        st.caption(f"{len(df_d)} matches rated. For finished matches the chances are "
-                   "worked out now, so they are a rough check and not the original "
-                   "pre-match numbers. Saved picks in History keep the original.")
+
+        locked = sorted({r["locked"] for r in drows})
+        st.caption(f"{len(df_d)} matches. 🔒 Picks locked at {', '.join(locked)} (UTC). "
+                   "They stay the same all day, and only the scores update.")
+        if df_d["rough"].any():
+            st.caption("Some days were first opened after their matches, so those "
+                       "chances are rough, not true pre-match numbers.")
 
         entries = []
-        today_iso = TODAY.strftime("%Y-%m-%d")
-        up = df_d[(df_d["state"] == "pre")]
-        for _, r in up.iterrows():
+        for _, r in df_d[(df_d["pre"]) & (df_d["iso"] >= TODAY.strftime("%Y-%m-%d"))].iterrows():
             tags = []
             if r["GG2+ %"] >= min2:
                 tags.append("GG2+")
@@ -810,11 +869,12 @@ with tab_daily:
                 tags.append("GG")
             if tags:
                 entries.append({
-                    "key": f"Daily|{r['iso']}|{r['Match']}", "saved": today_iso,
+                    "key": f"Daily|{r['iso']}|{r['Match']}",
+                    "saved": TODAY.strftime("%Y-%m-%d"),
                     "match_date": r["iso"], "source": "Daily", "home": r["Home"],
                     "away": r["Away"], "gg2": float(r["GG2+ %"]),
                     "gg1": float(r["GG %"]), "picked": ", ".join(tags),
-                    "hid": r["hid"], "score": None})
+                    "hid": r["hid"], "score": r["Score"] or None})
         add_history(entries)
 
     with st.expander("Leagues checked"):
@@ -892,14 +952,15 @@ with tab_hist:
                 st.success(f"{len(recs)} rows restored. Reload the page to see them.")
             except Exception:
                 st.error("That file could not be read.")
-    st.caption("History is kept on the app server. It is cleared when the app "
-               "restarts or when you change the code, so download it regularly. "
-               "You can always upload an old slip in 'My slip' to see its results.")
+    st.caption("History and the locked daily picks are kept on the app server. "
+               "They are cleared when the app restarts or when you change the code, "
+               "so download the history regularly.")
 
 with st.expander("How it works"):
     st.markdown("""
 **GG2+** means both teams score at least 2 goals each. **GG** means both teams
 score at least 1. The app estimates each team's goals from past results with a
-Poisson model, then works out the chance of each result. These are chances, not
-guarantees.
+Poisson model, then works out the chance of each result. The first time you open
+a day, its picks are saved and locked, so you always see the same list. These are
+chances, not guarantees.
 """)
