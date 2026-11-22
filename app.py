@@ -25,6 +25,8 @@ except Exception:
 st.set_page_config(page_title="GG Predictor", page_icon="⚽", layout="centered")
 
 # code: (competition name, results-file division, is_cup)
+# Leagues listed here use the results files for ratings. Every other league that
+# ESPN lists is found automatically and rated from each team's recent results.
 ESPN_COMPS = {
     "eng.1": ("England - Premier League", "E0", False),
     "eng.2": ("England - Championship", "E1", False),
@@ -72,13 +74,14 @@ ESPN_COMPS = {
     "uefa.europa": ("Europa League", None, True),
     "uefa.europa.conf": ("Conference League", None, True),
 }
-# Extra team lists used only to find teams from your slips. A wrong code returns nothing.
+# Always scanned too, in case ESPN's league list leaves them out.
 EXTRA_DIR_CODES = [
-    "eng.w.1", "esp.w.1", "ger.w.1", "fra.w.1", "ita.w.1", "usa.w.1",
+    "eng.w.1", "esp.w.1", "ger.w.1", "fra.w.1", "ita.w.1", "usa.w.1", "usa.nwsl",
     "uefa.w.champions", "ned.2", "ger.3", "por.2", "tur.2", "bel.2", "sco.3",
+    "sui.1", "isr.1",
     "qat.1", "ksa.1", "uae.1", "idn.1", "phi.1", "ind.1", "aus.1", "kor.1",
     "egy.1", "rsa.1", "col.1", "chi.1", "uru.1", "per.1", "ecu.1", "par.1",
-    "bol.1", "ven.1", "cro.1", "cze.1", "hun.1", "ukr.1", "isr.1", "ser.1",
+    "bol.1", "ven.1", "cro.1", "cze.1", "hun.1", "ukr.1", "ser.1",
     "bul.1", "svk.1", "slo.1", "nir.1", "wal.1", "isl.1", "cyp.1", "kaz.1",
     "tha.1", "mys.1", "sgp.1", "vnm.1", "hkg.1", "nzl.1", "crc.1", "gua.1",
     "hon.1", "pan.1", "jam.1", "mar.1", "tun.1", "alg.1", "nga.1", "gha.1",
@@ -119,6 +122,10 @@ WOMEN_RE = re.compile(r"\b(women|womens|wfc|ladies|lionesses|feminin\w*|frauen)\
 def is_women(name):
     n = str(name).strip()
     return bool(WOMEN_RE.search(n)) or bool(re.search(r"\bW$", n))
+
+
+def slug_is_women(code):
+    return bool(re.search(r"(^|\.)w(\.|$)|nwsl|femenil|wsl|women", code))
 
 
 def prob_k(lh, la, k):
@@ -315,10 +322,40 @@ def best_match(q, cands):
 
 # ---------------- Source 1: ESPN ----------------
 @lru_cache(maxsize=None)
+def all_slugs(bucket):
+    """Every soccer competition ESPN lists, plus our own codes and extra_leagues.txt."""
+    slugs = set(ESPN_COMPS) | set(EXTRA_DIR_CODES)
+    try:
+        page = 1
+        while page <= 12:
+            data = requests.get(
+                "https://sports.core.api.espn.com/v2/sports/soccer/leagues",
+                params={"limit": 1000, "page": page}, timeout=15,
+                headers=HEADERS).json()
+            for it in data.get("items") or []:
+                m = re.search(r"/leagues/([^/?]+)", str(it.get("$ref", "")))
+                if m:
+                    slugs.add(m.group(1))
+            if page >= int(data.get("pageCount") or 1):
+                break
+            page += 1
+    except Exception:
+        pass
+    try:
+        with open("extra_leagues.txt") as f:
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    slugs.add(s)
+    except Exception:
+        pass
+    # leave out youth competitions
+    return sorted(s for s in slugs if not re.search(r"u\d{2}", s))
+
+
+@lru_cache(maxsize=None)
 def directory(bucket):
     """All teams from ESPN league team lists: list of (id, name, is_women)."""
-    codes = list(ESPN_COMPS.keys()) + EXTRA_DIR_CODES
-
     def fetch(code):
         url = ("https://site.api.espn.com/apis/site/v2/sports/soccer/"
                f"{code}/teams?limit=1000")
@@ -326,15 +363,15 @@ def directory(bucket):
             data = requests.get(url, timeout=8, headers=HEADERS).json()
         except Exception:
             return []
-        w = ".w." in code
+        w = slug_is_women(code)
         out = []
         for d in _walk(data):
             if d.get("id") and d.get("displayName") and d.get("slug"):
                 out.append((str(d["id"]), str(d["displayName"]), w))
         return out
 
-    with ThreadPoolExecutor(8) as ex:
-        parts = list(ex.map(fetch, codes))
+    with ThreadPoolExecutor(16) as ex:
+        parts = list(ex.map(fetch, all_slugs(bucket)))
     seen, res = set(), []
     for part in parts:
         for t in part:
@@ -419,16 +456,27 @@ def espn_recent(team_id, bucket):
 def load_espn(start, end):
     rng = start if start == end else f"{start}-{end}"
 
-    def fetch(item):
-        code, (label, div, is_cup) = item
+    def fetch(code):
         url = ("https://site.api.espn.com/apis/site/v2/sports/soccer/"
                f"{code}/scoreboard?dates={rng}&limit=300")
-        rows = []
         try:
             data = requests.get(url, timeout=8).json()
         except Exception:
-            return rows
-        for e in data.get("events", []):
+            return []
+        events = data.get("events") or []
+        if not events:
+            return []
+        known = ESPN_COMPS.get(code)
+        if known:
+            label, div, is_cup = known
+        else:
+            try:
+                label = str(data["leagues"][0]["name"])
+            except Exception:
+                label = code
+            div, is_cup = None, False
+        rows = []
+        for e in events:
             try:
                 state = e["status"]["type"]["state"]
                 if state not in ("pre", "post"):
@@ -454,8 +502,8 @@ def load_espn(start, end):
                 continue
         return rows
 
-    with ThreadPoolExecutor(8) as ex:
-        out = list(ex.map(fetch, ESPN_COMPS.items()))
+    with ThreadPoolExecutor(16) as ex:
+        out = list(ex.map(fetch, all_slugs(BUCKET)))
     return [r for part in out for r in part]
 
 
@@ -694,14 +742,14 @@ def live_lams(sh, sa):
             float(np.clip((sa[0] + sh[1]) / 2 * 0.95, 0.25, 2.8)))
 
 
-def team_stats(src, tid, name):
+def team_stats(src, tid, name, fb=True):
     g = []
     if src == "espn" and tid:
         g = espn_recent(tid, BUCKET)
     elif src == "tsdb" and tid:
         g = tsdb_games(tid, BUCKET)
     s = stats_of(g)
-    if s:
+    if s or not fb:
         return s
     return lookup((name, is_women(name)), BUCKET)[0]
 
@@ -852,7 +900,8 @@ with st.sidebar:
     st.header("Settings")
     min2 = st.slider("GG2+ is strong from (%)", 8, 30, 14)
     min1 = st.slider("GG is strong from (%)", 30, 80, 50)
-    st.caption("Data sources: ESPN ✅ · TheSportsDB ✅ · API-Football "
+    st.caption(f"Scanning {len(all_slugs(BUCKET))} ESPN leagues")
+    st.caption("Other sources: TheSportsDB ✅ · API-Football "
                + ("✅" if AF_KEY else "⚪ (no key added)"))
 
 CFG2 = st.column_config.ProgressColumn("GG2+ %", min_value=0, max_value=100,
@@ -890,10 +939,20 @@ def rate_day(day_fx):
             pending.append(r)
     if pending:
         def work(r):
-            return (team_stats(r["src"], r["hid"], r["HomeTeam"]),
-                    team_stats(r["src"], r["aid"], r["AwayTeam"]))
-        with ThreadPoolExecutor(4) as ex:
+            return (team_stats(r["src"], r["hid"], r["HomeTeam"], fb=False),
+                    team_stats(r["src"], r["aid"], r["AwayTeam"], fb=False))
+        with ThreadPoolExecutor(12) as ex:
             outs = list(ex.map(work, pending))
+        # second pass: slower name search, limited so the page stays quick
+        todo = [i for i, (sh, sa) in enumerate(outs) if not (sh and sa)][:40]
+
+        def redo(i):
+            r = pending[i]
+            return (i, team_stats(r["src"], r["hid"], r["HomeTeam"], fb=True),
+                    team_stats(r["src"], r["aid"], r["AwayTeam"], fb=True))
+        with ThreadPoolExecutor(6) as ex:
+            for i, sh, sa in ex.map(redo, todo):
+                outs[i] = (sh, sa)
         for r, (sh, sa) in zip(pending, outs):
             if sh and sa:
                 rated.append((r, (*live_lams(sh, sa), "Live results")))
@@ -1044,7 +1103,7 @@ with tab_daily:
 
     refresh = st.button("🔄 Refresh picks (replaces the saved list for these days)")
 
-    with st.spinner("Loading matches from all sources..."):
+    with st.spinner("Loading matches from every league (the first time can take a minute)..."):
         fx = all_matches(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
     by_date = {}
     for r in fx:
@@ -1294,7 +1353,8 @@ with st.expander("How it works"):
 **GG2+** means both teams score at least 2 goals each. **GG** means both teams
 score at least 1. The app estimates each team's goals from past results with a
 Poisson model, then works out the chance of each result. Matches and results come
-from several sources (ESPN, TheSportsDB and, if a key is added, API-Football) and
-are merged. The first time you open a day, its picks are saved and locked, so you
-always see the same list. These are chances, not guarantees.
+from every league ESPN lists, plus TheSportsDB and, if a key is added,
+API-Football, all merged together. The first time you open a day, its picks are
+saved and locked, so you always see the same list. These are chances, not
+guarantees.
 """)
